@@ -417,6 +417,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             if self.backend_cls.get_name() in (
                 "FLASHMLA_SPARSE_DSV4",
                 "ROCM_FLASHMLA_SPARSE_DSV4",
+                "TRITON_MLA_SPARSE_DSV4",
                 "XPU_V4_MLA_SPARSE",
             ):
                 from vllm.models.deepseek_v4.common.ops.cache_utils import (
@@ -425,7 +426,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
                 _COMBINE_TOPK_SWA_INDICES_KERNEL.register_warmup()
 
-            from vllm.utils.import_utils import has_cutedsl
+            from vllm.utils.import_utils import is_cutedsl_supported
 
             _FUSED_Q_KV_RMSNORM_KERNEL.register_warmup()
 
@@ -451,7 +452,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     )
 
                     _COMPUTE_GLOBAL_TOPK_INDICES_AND_LENS_KERNEL.register_warmup()
-                    if has_cutedsl():
+                    if is_cutedsl_supported():
                         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (  # noqa: E501
                             _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL,
                         )
@@ -931,9 +932,9 @@ class DeepseekV4Indexer(nn.Module):
             "MXFP4" if self.use_fp4_kv else "FP8",
         )
         if vllm_config.kernel_config.enable_jit_warmup:
-            from vllm.utils.import_utils import has_cutedsl
+            from vllm.utils.import_utils import is_cutedsl_supported
 
-            if current_platform.is_cuda() and has_cutedsl():
+            if current_platform.is_cuda() and is_cutedsl_supported():
                 from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (  # noqa: E501
                     _INDEXER_Q_FP8_KERNEL,
                     _INDEXER_Q_MXFP4_KERNEL,
@@ -1017,6 +1018,7 @@ class DeepseekV4Indexer(nn.Module):
             skip_k_cache_insert=True,
             use_fp4_cache=self.use_fp4_kv,
             compress_ratio=self.compress_ratio,
+            num_heads=self.n_head,
         )
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.
@@ -1030,9 +1032,9 @@ class DeepseekV4Indexer(nn.Module):
             self._register_q_quant_warmup()
 
     def _register_q_quant_warmup(self) -> None:
-        from vllm.utils.import_utils import has_cutedsl
+        from vllm.utils.import_utils import is_cutedsl_supported
 
-        if not has_cutedsl() and not current_platform.is_xpu():
+        if not is_cutedsl_supported() and not current_platform.is_xpu():
             from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
                 _FUSED_INDEXER_Q_ROPE_MXFP4_TRITON_KERNEL,
                 _FUSED_INDEXER_Q_ROPE_QUANT_TRITON_KERNEL,

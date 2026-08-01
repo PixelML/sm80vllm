@@ -178,7 +178,12 @@ class DeepseekSparseSWABackend(AttentionBackend):
             )
 
             return DeepseekV4XPUSparseSWAMetadataBuilder
-        if current_platform.is_rocm():
+        # ROCm and CUDA SM8x share the ragged Triton decode kernels, which
+        # consume the ragged SWA metadata this builder adds.
+        if current_platform.is_rocm() or (
+            current_platform.is_cuda()
+            and not current_platform.has_device_capability(90)
+        ):
             from vllm.models.deepseek_v4.amd.rocm import (
                 DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
             )

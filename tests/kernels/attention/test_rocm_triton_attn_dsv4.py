@@ -11,8 +11,17 @@ import torch
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
+# These Triton kernels are also the CUDA SM8x (Ampere) sparse-MLA path, not
+# just ROCm's -- see vllm/models/deepseek_v4/ampere/ampere_sparse.py.
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_rocm(), reason="Only used by ROCm"
+    not (
+        current_platform.is_rocm()
+        or (
+            current_platform.is_cuda()
+            and not current_platform.has_device_capability(90)
+        )
+    ),
+    reason="ROCm or pre-Hopper CUDA only",
 )
 
 
@@ -3227,3 +3236,54 @@ def test_sparse_mla_backend_forward_mqa_fp8_ds_mla_merged_cache() -> None:
 
     err = (output.float() - ref).abs()
     assert err.max().item() < 0.02, f"max abs err {err.max().item()}"
+
+def test_sparse_attn_decode_int32_block_address_overflow() -> None:
+    """Block ids past 2^31 / stride must not wrap the cache addressing.
+
+    stride0 = 64 * 584 = 37376 B, so ids >= ~57.5k overflow int32. Only the
+    tail blocks are populated; a wrapped address reads zeros or faults.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _rocm_sparse_attn_decode_ragged_triton,
+    )
+
+    torch.manual_seed(3)
+    use_fnuz = current_platform.is_fp8_fnuz()
+    num_blocks, block_size = 58000, 64
+    n_fill, num_q, num_heads = 128, 2, 4
+    base_slot = (num_blocks - 2) * block_size
+
+    # Populate only the last two blocks, addressed past the int32 boundary.
+    kv = torch.zeros(base_slot + n_fill, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    kv[base_slot:] = torch.randn(n_fill, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    cache = _pack_fp8_ds_mla_cache(kv, block_size, use_fnuz=use_fnuz)
+
+    q = torch.randn(num_q, num_heads, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    rows = [
+        (base_slot + torch.randint(0, n_fill, (64,))).tolist() for _ in range(num_q)
+    ]
+    indices, indptr = _ragged_from_rows(rows, q.device)
+    scale = HEAD_DIM**-0.5
+
+    actual = _rocm_sparse_attn_decode_ragged_triton(
+        q=q,
+        main_cache=cache,
+        main_indices=indices,
+        main_indptr=indptr,
+        scale=scale,
+        attn_sink=None,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+    )
+    assert actual.isfinite().all()
+
+    expected = _ref_sparse_decode_ragged(
+        q,
+        cache,
+        rows,
+        scale,
+        None,
+        block_size,
+        main_use_fnuz=use_fnuz,
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)

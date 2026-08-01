@@ -63,11 +63,11 @@ from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
     get_paged_mqa_logits_metadata,
-    has_deep_gemm,
+    is_deep_gemm_supported,
     mqa_logits_mx_inputs,
     mqa_logits_use_mx_scales,
 )
-from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.import_utils import is_cutedsl_supported
 from vllm.utils.math_utils import round_up
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import (
@@ -84,6 +84,10 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.backends.mla.sparse_utils import SparseMLAPrefillRoute
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -107,7 +111,7 @@ def _assert_cutedsl_dcp_merge_supported(
     # stable-topk selector); there is no PyTorch fallback. The first cut targets
     # Blackwell/Hopper with index_topk in (512, 1024, 2048) (the selector's radix
     # sizing); the Triton pack itself has no shape/topk constraints.
-    if not has_cutedsl():
+    if not is_cutedsl_supported():
         raise RuntimeError(
             "DCP sparse-indexer merge requires CuteDSL; install it or disable DCP."
         )
@@ -801,6 +805,12 @@ def sparse_attn_indexer(
     # fill.
     if not skip_topk_buffer_clear:
         topk_indices_buffer[: hidden_states.shape[0]] = -1
+    # DeepGEMM availability is constant per process; check once for both branches.
+    use_deep_gemm = is_deep_gemm_supported()
+    if not use_deep_gemm:
+        assert not use_fp4_cache, (
+            "Triton sparse-MLA fallback does not support FP4 KV cache"
+        )
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -928,7 +938,9 @@ def sparse_attn_indexer(
                     q_slice_cast = q_slice
                     k_quant_cast = k_quant
                     k_scale_cast = k_scale.view(
-                        torch.int32 if mqa_logits_use_mx_scales() else torch.float32
+                        torch.int32
+                        if (use_deep_gemm and mqa_logits_use_mx_scales())
+                        else torch.float32
                     ).squeeze(-1)
                 # Chunks planned for fused_mqa_topk are not bounded by the logits
                 # budget: split their rows (budget-planned chunks, the only ones
@@ -952,7 +964,7 @@ def sparse_attn_indexer(
                         )
                         row_starts = cu_seqlen_ks[rows]
                         row_ends = cu_seqlen_ke[rows]
-                    else:
+                    elif use_deep_gemm:
                         q_scale_rows, chunk_weights = mqa_logits_mx_inputs(
                             q_slice_cast[rows],
                             q_scale_slice[rows] if q_scale_slice is not None else None,
@@ -979,6 +991,18 @@ def sparse_attn_indexer(
                         )
                         if not use_deep_select:
                             logits = as_fp32_logits(logits, row_ends)
+                    else:
+                        # SM80/SM121 Triton fallback (DeepGEMM unavailable).
+                        logits = fp8_mqa_logits_triton(
+                            q_slice_cast[rows],
+                            (k_quant_cast, k_scale_cast),
+                            prefill_weights[tokens],
+                            cu_seqlen_ks[rows],
+                            cu_seqlen_ke[rows],
+                            clean_logits=False,
+                        )
+                        row_starts = cu_seqlen_ks[rows]
+                        row_ends = cu_seqlen_ke[rows]
                     num_rows = logits.shape[0]
                     if candidate_blocks is not None:
                         # Two-level selection (v4.1): the candidate source
@@ -1158,7 +1182,7 @@ def sparse_attn_indexer(
                 decode_metadata.schedule_metadata,
                 max_model_len,
             )
-        else:
+        elif use_deep_gemm:
             padded_q_scale, decode_weights = mqa_logits_mx_inputs(
                 padded_q_quant_cast,
                 padded_q_scale,
@@ -1182,6 +1206,20 @@ def sparse_attn_indexer(
                 topk_backend
             ).takes_bf16_logits(logits, topk_tokens, logits.shape[0]):
                 logits = as_fp32_logits(logits, seq_lens.view(-1))
+        else:
+            # SM80/SM121 Triton fallback. Downstream topk reads only up to
+            # `seq_lens`, so size the buffer to the active batch max rather
+            # than the configured model max.
+            active_max_model_len = attn_metadata_narrowed.max_seq_len
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len=active_max_model_len,
+                clean_logits=False,
+            )
         num_rows = logits.shape[0]
         if candidate_blocks is not None:
             # Two-level selection (v4.1) on the decode logits; columns are
@@ -1330,6 +1368,7 @@ class SparseAttnIndexer(CustomOp):
         candidate_write: bool = False,
         cache_layout: str | None = None,
         skip_topk_buffer_clear: bool = False,
+        num_heads: int | None = None,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -1379,7 +1418,7 @@ class SparseAttnIndexer(CustomOp):
             and parallel_config.dcp_comm_backend == "a2a"
             and not parallel_config.use_ubatching
             and current_platform.is_cuda()
-            and has_cutedsl()
+            and is_cutedsl_supported()
         ):
             from vllm.v1.attention.ops.dcp import get_dcp_workspace_max_num_tokens
 
@@ -1390,11 +1429,36 @@ class SparseAttnIndexer(CustomOp):
             )
             if workspace is not None:
                 self.dcp_direct_topk_max_rows = max_rows
-        if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
+        # On SM80/SM121 (A100, GB10) DeepGEMM is unavailable — fall back to
+        # the Triton sparse-MLA path. is_deep_gemm_supported() encodes the
+        # SM-arch + has_deep_gemm() gate; if not supported, downgrade the
+        # hard error from upstream to a one-time warning so the indexer
+        # routes through the Triton kernels in `mqa_logits_triton.py`.
+        if current_platform.is_cuda() and not is_deep_gemm_supported():
+            logger.warning_once(
+                "DeepGEMM not supported on this platform; "
+                "using Triton fallback for sparse attention indexer."
             )
+            from vllm.v1.attention.ops.mqa_logits_triton import (
+                warmup_fp8_mqa_logits_triton,
+                warmup_fp8_paged_mqa_logits_triton,
+            )
+
+            effective_num_heads = num_heads or int(
+                getattr(vllm_config.model_config.hf_config, "index_n_heads", 0) or 0
+            )
+            if not use_fp4_cache and effective_num_heads > 0:
+                device = topk_indices_buffer.device
+                warmup_fp8_mqa_logits_triton(effective_num_heads, head_dim, device)
+                block_sizes = {
+                    64,
+                    256,
+                    vllm_config.cache_config.block_size,
+                }
+                for kernel_block_size in sorted(block_sizes):
+                    warmup_fp8_paged_mqa_logits_triton(
+                        effective_num_heads, head_dim, kernel_block_size, device
+                    )
 
         if vllm_config.kernel_config.enable_jit_warmup:
             from vllm.v1.attention.ops.common import (
@@ -1409,7 +1473,11 @@ class SparseAttnIndexer(CustomOp):
             )
             _UNPACK_SEQ_TRITON_KERNEL.register_warmup()
 
-            if self.dcp_world_size > 1 and current_platform.is_cuda() and has_cutedsl():
+            if (
+                self.dcp_world_size > 1
+                and current_platform.is_cuda()
+                and is_cutedsl_supported()
+            ):
                 from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (  # noqa: E501
                     _PACK_DCP_TOPK_CANDIDATES_KERNEL,
                     _STABLE_TOPK_FROM_GATHERED_CANDIDATES_KERNEL,

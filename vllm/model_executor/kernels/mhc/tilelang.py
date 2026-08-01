@@ -5,6 +5,52 @@ import torch
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+def _torch_hc_prenorm_gemm(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+) -> None:
+    assert out.shape[0] == 1
+    assert sqrsum.shape[0] == 1
+    x_float = x.float()
+    out[0].copy_(x_float @ fn.t())
+    sqrsum[0].copy_(x_float.square().sum(dim=-1))
+
+
+def _run_hc_prenorm_gemm_tilelang(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    hidden_size: int,
+    hc_mult: int,
+    tile_n: int = 12,
+    n_thr: int = 512,
+    n_splits: int = 1,
+) -> None:
+    if (x.shape[1] // n_splits) % n_thr != 0:
+        # Shape the tilelang kernels cannot tile; the prenorm GEMM output is
+        # tiny ([T, hc_mult3] + [T]), so torch is a cheap universal fallback.
+        _torch_hc_prenorm_gemm(x, fn, out, sqrsum)
+        return
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        _HC_PRENORM_GEMM_TILELANG_KERNEL,
+    )
+
+    _HC_PRENORM_GEMM_TILELANG_KERNEL(
+        x,
+        fn,
+        out,
+        sqrsum,
+        hidden_size,
+        hc_mult,
+        tile_n,
+        n_thr,
+        n_splits,
+    )
+
+
 def _hc_prenorm_gemm_outputs(
     x: torch.Tensor,
     fn: torch.Tensor,
@@ -38,11 +84,7 @@ def _hc_prenorm_gemm_outputs(
     if use_deep_gemm:
         tf32_hc_prenorm_gemm(x, fn, out, sqrsum, n_splits)
     else:
-        from vllm.model_executor.kernels.mhc.tilelang_kernels import (
-            _HC_PRENORM_GEMM_TILELANG_KERNEL,
-        )
-
-        _HC_PRENORM_GEMM_TILELANG_KERNEL(
+        _run_hc_prenorm_gemm_tilelang(
             x,
             fn,
             out,
@@ -94,7 +136,6 @@ def mhc_pre_delayed_tilelang(
 
     """
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
-        _HC_PRENORM_GEMM_TILELANG_KERNEL,
         mhc_pre_big_fuse_tilelang,
     )
     from vllm.model_executor.kernels.mhc.warmup import (
@@ -154,7 +195,7 @@ def mhc_pre_delayed_tilelang(
     if use_deep_gemm:
         tf32_hc_prenorm_gemm(x, fn, mixes, sqrsum, n_splits)
     else:
-        _HC_PRENORM_GEMM_TILELANG_KERNEL(
+        _run_hc_prenorm_gemm_tilelang(
             x,
             fn,
             mixes,
@@ -306,7 +347,6 @@ def mhc_fused_post_pre_delayed_tilelang(
 
     """
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
-        _HC_PRENORM_GEMM_TILELANG_KERNEL,
         _MHC_FUSED_TILELANG_KERNEL,
         _MHC_POST_TILELANG_KERNEL,
         mhc_fused_post_pre_split_config,
@@ -404,7 +444,7 @@ def mhc_fused_post_pre_delayed_tilelang(
         if use_deep_gemm:
             tf32_hc_prenorm_gemm(residual_cur_2d, fn, mixes, sqrsum, n_splits)
         else:
-            _HC_PRENORM_GEMM_TILELANG_KERNEL(
+            _run_hc_prenorm_gemm_tilelang(
                 residual_cur_2d,
                 fn,
                 mixes,
@@ -742,7 +782,7 @@ def mhc_pre_broadcast_tilelang(
         fn_broadcast,
         hidden_size=hidden_size,
         hc_mult=hc_mult,
-        use_tilelang_fallback=False,
+        use_tilelang_fallback=True,
     )
     _MHC_PRE_BIG_FUSE_TILELANG_KERNEL(
         gemm_out_mul,
