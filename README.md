@@ -33,14 +33,24 @@ Full provenance, licenses, and per-branch status are in
 | Model | Branch | Status | Notes |
 | --- | --- | --- | --- |
 | DeepSeek-V4-Flash (text) | `sm80` | Serving, published | `ghcr.io/pixelml/club-170hx:vllm-deepseek-v4-sm80-20260902`; see `club-170hx` `docs/MODEL-STATUS.md` |
-| DeepSeek-V4-Flash-Vision-Exp | `sm80` (vision hunks in `PixelML/DeepSeek-V4-Flash-Vision-Exp-CMP-170HX`) | Serving, published | Reverse-ported vision path onto this fork's attention backend; see that repo's `docs/VISION-PORT.md` |
+| DeepSeek-V4-Flash-Vision-Exp | `sm80` | Serving, published; two known limits below | Reverse-ported vision path (Path 3), consolidated onto this branch; see `docs/SM80.md` and `PixelML/DeepSeek-V4-Flash-Vision-Exp-CMP-170HX` `docs/VISION-PORT.md` |
 | GLM-5.3-Flash | `glm53-sm80` | In progress (repo-only Phase A as of 2026-09-03) | See issue [#103](https://github.com/seanphan/pixelml/issues/103) for the port plan and inventory |
+| Qwen3.8-27B | stock vLLM (no fork changes needed) | Serving, published | No SM80 fallback required; see `club-170hx` `docs/MODEL-STATUS.md` |
+
+### Known limits (DeepSeek-V4-Flash-Vision-Exp)
+
+- **`c>=4` crash**: an EngineCore crash at concurrency 4 and above.
+  Root-caused and fixed on `sm80`; not yet re-verified on a GPU boot.
+  See [seanphan/pixelml#79](https://github.com/seanphan/pixelml/issues/79).
+- **131k-token crash**: prefill past 65,000 tokens crashes the engine.
+  Root-caused and fixed on `sm80`; not yet re-verified on a GPU boot.
+  See [seanphan/pixelml#79](https://github.com/seanphan/pixelml/issues/79).
 
 ### Build instructions
 
 ```bash
 git checkout sm80   # or glm53-sm80 once that branch has a bootable model
-TORCH_CUDA_ARCH_LIST=8.0 docker build -f Dockerfile.fullbuild16 -t <tag> .
+TORCH_CUDA_ARCH_LIST=8.0 docker build -f docker/Dockerfile.sm80 -t <tag> .
 ```
 
 A from-source build takes about 60 minutes on the `club-170hx` build host.
