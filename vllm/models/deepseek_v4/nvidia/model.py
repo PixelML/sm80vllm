@@ -66,6 +66,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
@@ -562,6 +563,12 @@ class DeepseekV4MoE(nn.Module):
 
         self.gate.e_score_correction_bias = None
         self.gate.tid2eid = None
+        self.gate.bias_vl = None
+        # Image tokens borrow five consecutive reserved in-vocab ids starting
+        # at IMAGE_SENTINEL_BASE_ID; 0 disables vision routing (text model).
+        self.image_sentinel_lo = (
+            IMAGE_SENTINEL_BASE_ID if getattr(config, "vision_n_layers", 0) > 0 else 0
+        )
         is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
         if is_hash_moe:
@@ -577,8 +584,21 @@ class DeepseekV4MoE(nn.Module):
                 ),
                 requires_grad=False,
             )
-        elif getattr(config, "topk_method", None) == "noaux_tc":
+        if getattr(config, "topk_method", None) == "noaux_tc" and (
+            not is_hash_moe or getattr(config, "vision_n_layers", 0) > 0
+        ):
+            # Vision checkpoints ship a gate bias on hash layers too (it is
+            # unused for routing there; image tokens use bias_vl instead).
             self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+
+        if getattr(config, "vision_n_layers", 0) > 0:
+            # Vision checkpoints route image sentinel tokens with bias_vl
+            # instead of e_score_correction_bias / the hash table. Created on
+            # every MoE layer, hash layers included.
+            self.gate.bias_vl = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
@@ -689,6 +709,8 @@ class DeepseekV4MoE(nn.Module):
             router_logits_dtype=torch.float32,
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
+            bias_vl=getattr(self.gate, "bias_vl", None),
+            image_sentinel_lo=self.image_sentinel_lo,
         )
 
     def forward(
@@ -696,6 +718,10 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+        # getattr for test doubles that fake the gate module.
+        bias_vl = getattr(self.gate, "bias_vl", None)
+        if bias_vl is not None and input_ids is None:
+            raise ValueError("DeepSeek V4 vision MoE routing requires input_ids.")
 
         if not self.use_mega_moe:
             return self._forward_fused_moe(hidden_states, input_ids)

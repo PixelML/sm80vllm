@@ -1375,8 +1375,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
         if not self.is_first_pp_rank:
-            # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
+            # Update for non-first PP ranks. Hidden states arrive via
+            # intermediate_tensors, so embeddings are never needed here.
+            # Raw input_ids are a separate concern: models that set
+            # requires_raw_input_tokens (e.g. DeepSeek V4 Vision's MoE
+            # image-token routing) thread input_ids through every decoder
+            # layer on every PP rank, not just to build the initial
+            # embedding on rank 0. Only null input_ids here when the model
+            # does not need it, so non-vision behaviour is unchanged.
+            if not self.model.requires_raw_input_tokens:
+                model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
 
             # Prepare the intermediate tensors.
