@@ -1216,6 +1216,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
 
         for name, loaded_weight in weights:
+            # Vision-Exp checkpoints store ffn.gate.bias on hash-MoE layers
+            # too, where routing is vocabulary-hash based and the fork
+            # intentionally registers no e_score_correction_bias parameter.
+            if name.endswith("ffn.gate.e_score_correction_bias"):
+                m = re.search(r"layers\.(\d+)\.", name)
+                if m and int(m.group(1)) < self.config.num_hash_layers:
+                    continue
             if pad_shared_expert and ".shared_experts." in name:
                 loaded_weight = self._pad_shared_expert_weight(
                     self.quant_config, name, loaded_weight
@@ -1507,7 +1514,7 @@ class DeepseekV4ForCausalLM(
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
+        loader = AutoWeightsLoader(self, skip_substrs=["mtp.", "vision.", "aligner.", "image_", "_vl"])
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
