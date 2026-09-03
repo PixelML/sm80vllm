@@ -828,6 +828,69 @@ def _apply_matches(
     return cast(list[_S], out_seqs), out_result
 
 
+class _PlannedPromptUpdate(NamedTuple):
+    """One resolved update paired with where it matched in the prompt."""
+
+    update: "ResolvedPromptUpdate"
+    match: "PromptTargetMatch"
+
+
+def _plan_prompt_updates(
+    prompt: _S,
+    mm_prompt_updates: "MultiModalPromptUpdates",
+    tokenizer: TokenizerLike | None = None,
+) -> tuple[list[_PlannedPromptUpdate], "MultiModalPromptUpdatesApplyResult"]:
+    """
+    Compatibility shim: resolve the matches that :func:`_apply_matches` would
+    apply, without applying them, so a caller can splice in extra content
+    (e.g. alignment padding) that depends on the final position of each
+    match. Returns a flat, left-to-right ordered list of
+    `_PlannedPromptUpdate` alongside the same result mapping that
+    `_apply_matches` returns.
+    """
+    mm_item_counts = {m: len(items) for m, items in mm_prompt_updates.items()}
+
+    out_result: MultiModalPromptUpdatesApplyResult = {
+        m: [None] * len(items) for m, items in mm_prompt_updates.items()
+    }
+    planned = list[_PlannedPromptUpdate]()
+
+    mm_found_counts = {
+        m: sum(r is not None for r in res) for m, res in out_result.items()
+    }
+    if _all_items_found(mm_item_counts, mm_found_counts):
+        return planned, out_result
+
+    prev_end_idx = 0
+    while True:
+        mode, matches_to_apply = _find_matches(
+            prompt,
+            mm_prompt_updates,
+            tokenizer,
+            prev_end_idx=prev_end_idx,
+            current_result=out_result,
+        )
+
+        if mode is None:
+            break  # No more matches to find
+
+        for (modality, item_idx), (match, update_idx) in matches_to_apply:
+            matched_update = mm_prompt_updates[modality][item_idx][update_idx]
+            planned.append(_PlannedPromptUpdate(update=matched_update, match=match))
+            out_result[modality][item_idx] = update_idx
+
+            # Exclude overlapping matches
+            prev_end_idx = match.end_idx
+
+        mm_found_counts = {
+            m: sum(r is not None for r in res) for m, res in out_result.items()
+        }
+        if _all_items_found(mm_item_counts, mm_found_counts):
+            break
+
+    return planned, out_result
+
+
 def apply_token_matches(
     prompt: list[int],
     mm_prompt_updates: "MultiModalPromptUpdates",

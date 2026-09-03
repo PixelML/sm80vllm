@@ -363,6 +363,10 @@ _MULTIMODAL_MODELS = {
         "Cohere2VisionForConditionalGeneration",
     ),
     "Cosmos3ForConditionalGeneration": ("cosmos3", "Cosmos3ForConditionalGeneration"),
+    "DeepseekV4ForConditionalGeneration": (
+        "vllm.models.deepseek_v4",
+        "DeepseekV4ForConditionalGeneration",
+    ),
     "Cosmos3EdgeForConditionalGeneration": (
         "cosmos3_edge",
         "Cosmos3EdgeForConditionalGeneration",

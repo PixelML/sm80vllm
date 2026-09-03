@@ -209,7 +209,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
+                # DSpark + PP is enabled here (see pp_utils.broadcast_draft and
+                # dspark/utils.load_dspark_model). It works because the drafter is
+                # already built on the last PP rank only (above), and for
+                # DeepSeek-V4 the aux-hidden-state taps (dspark_target_layer_ids
+                # = [40,41,42] of 43 layers) plus lm_head all land on that same
+                # last rank. eagle3/dflash keep the guard -- untested, and their
+                # aux layers are spread across ranks.
+                if self.use_pp and self.speculative_config.method != "dspark":
                     raise ValueError(
                         f"{self.speculative_config.method} with pipeline parallel "
                         "is not supported."
@@ -830,7 +837,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.pp_handler is not None:
             outputs = self.pp_handler.get_prev_sampled_outputs()
             if outputs is not None:
+                # Spec decode: scatter the relayed proposed draft tokens into this
+                # rank's state so the next step's combine_sampled_and_draft_tokens
+                # reads real values instead of zero-init (which gives ~0 acceptance
+                # and corrupt output). Pop before postprocess_sampled, which does
+                # not accept this kwarg. idx_mapping is -1 for excluded/freed reqs.
+                draft_tokens = outputs.pop("draft_tokens", None)
+                idx_mapping = outputs["idx_mapping"]
                 self.postprocess_sampled(**outputs)
+                if draft_tokens is not None:
+                    valid = idx_mapping >= 0
+                    self.req_states.draft_tokens[idx_mapping[valid]] = draft_tokens[
+                        valid
+                    ]
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:
@@ -929,6 +948,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
         assert num_tokens > 0
+        if (
+            num_tokens_after_padding > num_tokens
+            and getattr(self.model, "requires_raw_input_tokens", False)
+        ):
+            # Models that thread raw input_ids through every PP rank (vision
+            # bias_vl MoE routing) must never read a stale, possibly
+            # sentinel-range token id left in an unfilled CUDA-graph padding
+            # row from a prior, larger batch at this bucket size. Text-only
+            # models keep input_ids=None on non-first ranks and are
+            # unaffected (see cudagraph_utils.py's matching guard).
+            self.input_buffers.input_ids[num_tokens:num_tokens_after_padding].fill_(0)
         if envs.VLLM_MOE_SKIP_PADDING:
             # Mark trailing cudagraph-padding rows so kernels can skip work for
             # them when supported.
@@ -1356,8 +1386,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
         if not self.is_first_pp_rank:
-            # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
+            # Update for non-first PP ranks. Hidden states arrive via
+            # intermediate_tensors, so embeddings are never needed here.
+            # Raw input_ids are a separate concern: models that set
+            # requires_raw_input_tokens (e.g. DeepSeek V4 Vision's MoE
+            # image-token routing) thread input_ids through every decoder
+            # layer on every PP rank, not just to build the initial
+            # embedding on rank 0. Only null input_ids here when the model
+            # does not need it, so non-vision behaviour is unchanged.
+            if not self.model.requires_raw_input_tokens:
+                model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
 
             # Prepare the intermediate tensors.
@@ -1578,6 +1616,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if self.pp_handler is not None:
+                # Relay the proposed draft tokens to the non-last PP ranks so
+                # their next-step combine_sampled_and_draft_tokens reads real
+                # values instead of zero-init (otherwise acceptance ~= 0 and the
+                # output is garbage). Must be issued after propose().
+                self.pp_handler.broadcast_draft(draft_tokens, input_batch)
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does

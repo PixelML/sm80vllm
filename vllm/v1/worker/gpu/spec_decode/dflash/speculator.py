@@ -521,6 +521,14 @@ def _prepare_dflash_inputs_kernel(
 
     num_rejected = tl.load(num_rejected_ptr + req_idx)
     valid_ctx_end = ctx_end - num_rejected
+    # A boundary-sized chunk (common on long, heavily-chunked prefills,
+    # e.g. 131k tokens at --max-num-batched-tokens 2048) can have every
+    # scheduled token rejected by DSpark verify, collapsing valid_ctx_end
+    # to ctx_start or below. Clamp so the position lookup below never reads
+    # before this request's own context window; downstream consumers only
+    # ever read the bonus-token/query rows this feeds, so a clamped, inert
+    # position for a fully-rejected chunk changes nothing observable.
+    valid_ctx_end = tl.maximum(valid_ctx_end, ctx_start + 1)
 
     num_sampled = tl.load(num_sampled_ptr + req_idx)
     if num_sampled > 0:
