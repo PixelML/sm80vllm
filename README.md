@@ -19,6 +19,42 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ---
 
+## PixelML SM80 fork
+
+This fork carries NVIDIA Ampere (compute capability 8.0) fallback kernels
+for model families whose upstream vLLM support targets Hopper or newer.
+It exists for the PixelML `club-170hx` hardware group (4x NVIDIA CMP 170HX,
+GA100 silicon, 64 GiB HBM2e per card, no FP4/FP8 tensor cores, no NVLink).
+Full provenance, licenses, and per-branch status are in
+[`docs/SM80.md`](docs/SM80.md).
+
+### Supported models
+
+| Model | Branch | Status | Notes |
+| --- | --- | --- | --- |
+| DeepSeek-V4-Flash (text) | `sm80` | Serving, published | `ghcr.io/pixelml/club-170hx:vllm-deepseek-v4-sm80-20260902`; see `club-170hx` `docs/MODEL-STATUS.md` |
+| DeepSeek-V4-Flash-Vision-Exp | `sm80` (vision hunks in `PixelML/DeepSeek-V4-Flash-Vision-Exp-CMP-170HX`) | Serving, published | Reverse-ported vision path onto this fork's attention backend; see that repo's `docs/VISION-PORT.md` |
+| GLM-5.3-Flash | `glm53-sm80` | In progress (repo-only Phase A as of 2026-09-03) | See issue [#103](https://github.com/seanphan/pixelml/issues/103) for the port plan and inventory |
+
+### Build instructions
+
+```bash
+git checkout sm80   # or glm53-sm80 once that branch has a bootable model
+TORCH_CUDA_ARCH_LIST=8.0 docker build -f Dockerfile.fullbuild16 -t <tag> .
+```
+
+A from-source build takes about 60 minutes on the `club-170hx` build host.
+See `club-170hx` `docs/DOCKER-IMAGE.md` for the exact published image
+digests and launch commands.
+
+### Links
+
+- Platform manual and benchmarks: [`PixelML/club-170hx`](https://github.com/PixelML/club-170hx)
+- DeepSeek-V4 vision port evidence: [`PixelML/DeepSeek-V4-Flash-Vision-Exp-CMP-170HX`](https://github.com/PixelML/DeepSeek-V4-Flash-Vision-Exp-CMP-170HX)
+- GLM-5.3-Flash tracking issue: [seanphan/pixelml#103](https://github.com/seanphan/pixelml/issues/103)
+
+---
+
 ## About
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
