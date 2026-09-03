@@ -391,6 +391,55 @@ class DeepseekV4VLDummyInputsBuilder(
 class DeepseekV4VLMultiModalProcessor(
     BaseMultiModalProcessor[DeepseekV4VLProcessingInfo]
 ):
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        # ``DeepseekV4VLProcessor`` (our stand-in "HF processor") only knows
+        # how to turn PIL images into ViT patches; unlike a real HF
+        # processor it never tokenizes ``text`` and so never populates
+        # ``input_ids``. The base ``_apply_hf_processor_text_mm`` requires
+        # ``input_ids`` in the returned `BatchFeature` (it pops the key
+        # right after calling us), so tokenize the prompt ourselves and
+        # merge it in. The prompt still carries the literal, un-expanded
+        # ``IMAGE_PLACEHOLDER`` text/token once per image at this point;
+        # expansion into the full per-image sentinel block happens later,
+        # in ``_get_prompt_updates`` / ``_apply_token_matches_with_placeholders``.
+        processed_data = super()._call_hf_processor(
+            prompt=prompt,
+            mm_data=mm_data,
+            mm_kwargs=mm_kwargs,
+            tok_kwargs=tok_kwargs,
+        )
+
+        if "input_ids" not in processed_data:
+            tokenizer = self.info.get_tokenizer()
+            encode_kwargs = dict(tok_kwargs)
+            encode_kwargs.setdefault("add_special_tokens", False)
+            input_ids = tokenizer.encode(prompt, **encode_kwargs)
+            processed_data["input_ids"] = [input_ids]
+
+        return processed_data
+
+    def _hf_processor_applies_updates(
+        self,
+        prompt_text: str,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> bool:
+        # ``DeepseekV4VLProcessor`` never expands the raw image placeholder
+        # token into the per-image sentinel block itself (it only produces
+        # pixel-derived fields); that expansion is done afterwards by
+        # ``_get_prompt_updates`` / ``_apply_token_matches_with_placeholders``.
+        # The base class default (``True`` whenever mm data is present)
+        # would tell vLLM to skip that step, leaving the raw placeholder
+        # token in the prompt and failing placeholder validation.
+        return False
+
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
