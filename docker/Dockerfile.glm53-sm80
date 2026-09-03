@@ -1,0 +1,67 @@
+# Full CUDA source build of the `glm53-sm80` branch for NVIDIA Ampere
+# (compute capability 8.0, e.g. CMP 170HX / A100). Build from the repo
+# root: `docker build -f docker/Dockerfile.glm53-sm80 -t glm53-sm80:test .`
+#
+# Lineage: same Dockerfile.fullbuild16 lineage as docker/Dockerfile.sm80
+# (haosdent/vllm@dsv4-flash-a100 -> allover326 fullbuild16 -> PixelML
+# sm80 fork), applied to the glm53-sm80 branch (wtdcode/vllm-backport
+# GLM-5.3-Flash SM80 enablement, vendored with provenance in docs/SM80.md).
+# glm53-sm80 is NOT a descendant of sm80 -- independent commit history,
+# same technique (Triton sparse-MLA / kpool fallback on SM80).
+FROM nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev python3.12-venv git build-essential curl \
+        ca-certificates ccache cmake ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+RUN python3.12 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/lib/ccache:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV CUDA_HOME=/usr/local/cuda
+
+# ccache and pip/cargo build caches persisted under /models (bind-mounted
+# at build time with --build-arg / BuildKit cache mounts is preferred;
+# these ENV vars set the in-image default location so a rerun without a
+# cache mount still benefits from anything baked into a prior layer).
+ENV CCACHE_DIR=/models/claude-bench/glm-sm80-port/build-cache/ccache
+ENV PIP_CACHE_DIR=/models/claude-bench/glm-sm80-port/build-cache/pip
+# CARGO_HOME left at default (/root/.cargo) so rustup binaries land on PATH
+
+WORKDIR /vllm
+COPY . /vllm/
+
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
+ENV TORCH_CUDA_ARCH_LIST=8.0
+ENV MAX_JOBS=16
+ENV CMAKE_BUILD_TYPE=Release
+ENV VLLM_TARGET_DEVICE=cuda
+
+RUN pip install --no-cache-dir -U pip "setuptools>=77.0.3,<81.0.0" wheel \
+        "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" ninja "cmake>=3.26.1" \
+        "packaging>=24.2" jinja2
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain 1.95 --profile minimal
+ENV PATH=/root/.cargo/bin:$PATH
+RUN pip install --no-cache-dir torch==2.13.0 torchaudio==2.11.0 torchvision==0.28.0
+
+RUN rustc --version && pip install --no-cache-dir -e . --no-build-isolation
+
+# Runtime overlay: F8_E8M0 dtype support for the installed safetensors
+# package (same patch as the sm80/DeepSeek-V4 branch -- glm5next's kpool
+# fp8 writes rely on the same safetensors dtype handling).
+COPY patches/safetensors_torch_f8_e8m0.py \
+     /opt/venv/lib/python3.12/site-packages/safetensors/torch.py
+
+# Build + import gate: fail the build if the compiled extension, the
+# glm5_next model class, custom ops, or the Marlin AWQ kernel do not
+# import. Mirrors the DeepSeek-V4 gate in docker/Dockerfile.sm80.
+RUN nvcc --version | tail -2 \
+    && python3 -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__)" \
+    && ls -la /vllm/vllm/*.so \
+    && python3 -c "import torch, vllm; import vllm._custom_ops as o; print('custom ops import OK')" \
+    && python3 -c "\
+from vllm.models.glm5next.nvidia.model import Glm5NextForCausalLM; \
+print('glm5_next model class import OK')" \
+    && python3 -c "\
+from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig; \
+print('Marlin AWQ kernel import OK')"
