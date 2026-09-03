@@ -948,6 +948,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
         assert num_tokens > 0
+        if (
+            num_tokens_after_padding > num_tokens
+            and getattr(self.model, "requires_raw_input_tokens", False)
+        ):
+            # Models that thread raw input_ids through every PP rank (vision
+            # bias_vl MoE routing) must never read a stale, possibly
+            # sentinel-range token id left in an unfilled CUDA-graph padding
+            # row from a prior, larger batch at this bucket size. Text-only
+            # models keep input_ids=None on non-first ranks and are
+            # unaffected (see cudagraph_utils.py's matching guard).
+            self.input_buffers.input_ids[num_tokens:num_tokens_after_padding].fill_(0)
         if envs.VLLM_MOE_SKIP_PADDING:
             # Mark trailing cudagraph-padding rows so kernels can skip work for
             # them when supported.
