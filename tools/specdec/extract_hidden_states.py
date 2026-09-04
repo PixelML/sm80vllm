@@ -31,6 +31,70 @@ HIDDEN = 4096
 BYTES_PER_TOKEN = len(AUX_LAYERS) * HIDDEN * 2  # bf16
 
 
+def preflight(need_datasets: bool) -> None:
+    """Check every import and the writability of the output BEFORE the engine
+    loads 177 GiB of weights.
+
+    Three runs of this lane died after an 8-12 minute weight load for reasons a
+    two-second check would have caught. Everything cheap now runs first.
+    """
+    import importlib
+
+    required = ["numpy", "torch", "safetensors", "vllm"]
+    if need_datasets:
+        required.append("datasets")
+    missing = []
+    for mod in required:
+        try:
+            importlib.import_module(mod)
+        except ImportError:
+            missing.append(mod)
+    if missing:
+        raise SystemExit(
+            "preflight failed: missing "
+            + ", ".join(missing)
+            + f"\n  fix: pip install {' '.join(missing)}"
+            + ("\n  or:  pass --corpus-jsonl to skip the `datasets` dependency"
+               if "datasets" in missing else "")
+        )
+    here = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.exists(os.path.join(here, "specdec_worker_ext.py")):
+        raise SystemExit(
+            "preflight failed: specdec_worker_ext.py must sit beside this script "
+            "(it is loaded by worker_extension_cls in every worker process)"
+        )
+    print("[preflight] ok:", ", ".join(required))
+
+
+def load_corpus_jsonl(path: str, n_tokens: int, tokenizer) -> list[str]:
+    """No-`datasets` fallback: one JSON object per line with a "text" or
+    "messages" field. Lets extraction run on an image that has nothing but
+    torch and vLLM, which is the common case."""
+    import json
+
+    texts, got = [], 0
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            text = row.get("text")
+            if text is None:
+                text = "\n".join(
+                    m.get("content", "") for m in (row.get("messages") or [])
+                )
+            if not text or not text.strip():
+                continue
+            texts.append(text)
+            got += len(tokenizer.encode(text))
+            if got >= n_tokens:
+                break
+    if not texts:
+        raise SystemExit(f"no usable rows in {path}")
+    return texts
+
+
 def load_corpus(n_tokens: int, tokenizer) -> list[str]:
     """Permissive-licence mix, deliberately spanning the acceptance regimes.
 
@@ -73,7 +137,12 @@ def main() -> None:
     ap.add_argument("--tp", type=int, default=4)
     ap.add_argument("--max-len", type=int, default=4096)
     ap.add_argument("--shard-tokens", type=int, default=50_000)
+    ap.add_argument("--corpus-jsonl", help="pre-tokenizable JSONL "
+                    "(one object per line, \"text\" or \"messages\"); "
+                    "avoids the `datasets` dependency entirely")
     args = ap.parse_args()
+
+    preflight(need_datasets=args.corpus_jsonl is None)
 
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -103,7 +172,8 @@ def main() -> None:
         raise SystemExit(f"refusing: no rank installed hooks ({hooked})")
 
     tok = llm.get_tokenizer()
-    texts = load_corpus(args.tokens, tok)
+    texts = (load_corpus_jsonl(args.corpus_jsonl, args.tokens, tok)
+             if args.corpus_jsonl else load_corpus(args.tokens, tok))
     sp = SamplingParams(max_tokens=1, temperature=0.0)
 
     shard, shard_tokens, shard_idx = [], 0, 0
