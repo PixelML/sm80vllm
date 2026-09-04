@@ -20,61 +20,15 @@ import argparse
 import json
 import os
 import pathlib
+import sys
 import time
+
+# The worker extension module must be importable inside every worker process.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 AUX_LAYERS = (5, 14, 24, 33, 42)  # dflash_config.target_layer_ids for GLM-5.3-Flash
 HIDDEN = 4096
 BYTES_PER_TOKEN = len(AUX_LAYERS) * HIDDEN * 2  # bf16
-
-
-def _worker_install_hooks(self, layers: tuple[int, ...]) -> str:
-    """Runs inside each TP worker via collective_rpc. Buffers aux states on the module."""
-    import torch
-    from vllm.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() != 0:
-        return "skipped-nonzero-rank"
-
-    model = self.model_runner.get_model()
-    inner = model
-    for attr in ("language_model", "model"):
-        nxt = getattr(inner, attr, None)
-        if nxt is not None and hasattr(nxt, "layers"):
-            inner = nxt
-            break
-        if nxt is not None:
-            inner = nxt
-    decoder_layers = inner.layers
-
-    buf: list[torch.Tensor] = []
-    model._specdec_buf = buf  # type: ignore[attr-defined]
-
-    def make_hook(slot: int):
-        def hook(_module, _args, output):
-            hs = output[0] if isinstance(output, tuple) else output
-            # Detach to host immediately; these are large and we do not want them
-            # pinned in the KV pool's memory budget.
-            # numpy has no bfloat16: t.numpy() raises TypeError on a bf16
-            # tensor. Keep the exact bit pattern by viewing as int16 (same 2
-            # bytes, lossless); the loader views it back. Casting to float16
-            # instead would silently overflow on large activations.
-            buf.append(
-                (slot, hs.detach().to(torch.bfloat16).cpu().view(torch.int16))
-            )
-        return hook
-
-    handles = [decoder_layers[i].register_forward_hook(make_hook(n))
-               for n, i in enumerate(layers) if i < len(decoder_layers)]
-    model._specdec_handles = handles  # type: ignore[attr-defined]
-    return f"hooked {len(handles)} layers of {len(decoder_layers)}"
-
-
-def _worker_drain(self) -> list:
-    model = self.model_runner.get_model()
-    buf = getattr(model, "_specdec_buf", [])
-    out = [(slot, t.numpy()) for slot, t in buf]
-    buf.clear()
-    return out
 
 
 def load_corpus(n_tokens: int, tokenizer) -> list[str]:
@@ -134,13 +88,19 @@ def main() -> None:
 
     llm = LLM(
         model=args.model,
+        # String-dispatched RPC: no pickled callable, so this needs no
+        # VLLM_ALLOW_INSECURE_SERIALIZATION escape hatch.
+        worker_extension_cls="specdec_worker_ext.SpecDecWorkerExtension",
         tensor_parallel_size=args.tp,
         enforce_eager=True,
         gpu_memory_utilization=0.85,
         max_model_len=args.max_len,
         limit_mm_per_prompt={"image": 0, "video": 0},
     )
-    print(llm.collective_rpc(_worker_install_hooks, args=(AUX_LAYERS,)))
+    hooked = llm.collective_rpc("install_aux_hooks", args=(AUX_LAYERS,))
+    print("[hooks]", hooked)
+    if not any(isinstance(h, str) and h.startswith("hooked ") for h in hooked):
+        raise SystemExit(f"refusing: no rank installed hooks ({hooked})")
 
     tok = llm.get_tokenizer()
     texts = load_corpus(args.tokens, tok)
@@ -157,7 +117,7 @@ def main() -> None:
         if len(ids) < 32:
             continue
         llm.generate([{"prompt_token_ids": ids}], sp)
-        captured = llm.collective_rpc(_worker_drain)
+        captured = llm.collective_rpc("drain_aux")
         states = next((c for c in captured if c), None)
         if not states:
             continue
