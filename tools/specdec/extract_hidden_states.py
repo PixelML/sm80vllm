@@ -54,7 +54,13 @@ def _worker_install_hooks(self, layers: tuple[int, ...]) -> str:
             hs = output[0] if isinstance(output, tuple) else output
             # Detach to host immediately; these are large and we do not want them
             # pinned in the KV pool's memory budget.
-            buf.append((slot, hs.detach().to(torch.bfloat16).cpu()))
+            # numpy has no bfloat16: t.numpy() raises TypeError on a bf16
+            # tensor. Keep the exact bit pattern by viewing as int16 (same 2
+            # bytes, lossless); the loader views it back. Casting to float16
+            # instead would silently overflow on large activations.
+            buf.append(
+                (slot, hs.detach().to(torch.bfloat16).cpu().view(torch.int16))
+            )
         return hook
 
     handles = [decoder_layers[i].register_forward_hook(make_hook(n))
@@ -141,7 +147,8 @@ def main() -> None:
     sp = SamplingParams(max_tokens=1, temperature=0.0)
 
     shard, shard_tokens, shard_idx = [], 0, 0
-    manifest = {"aux_layers": list(AUX_LAYERS), "hidden": HIDDEN, "dtype": "bfloat16",
+    manifest = {"aux_layers": list(AUX_LAYERS), "hidden": HIDDEN,
+                "dtype": "bfloat16", "storage": "int16-view",
                 "model": args.model, "shards": []}
     t0 = time.time()
     total = 0

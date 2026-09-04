@@ -28,6 +28,16 @@ from drafter import DFlash2Drafter, DrafterConfig
 from eval_acceptance import acceptance_curve, predicted_tok_s
 
 
+def _aux_to_bf16(a: np.ndarray) -> torch.Tensor:
+    """Aux states are stored as an int16 view of bf16 (numpy has no bfloat16).
+
+    Reinterpret rather than cast: the bytes are already bf16.
+    """
+    if a.dtype == np.int16:
+        return torch.from_numpy(np.ascontiguousarray(a)).view(torch.bfloat16)
+    return torch.from_numpy(a.astype(np.float32)).bfloat16()
+
+
 class ShardData:
     """Loads the extractor's shard format: aux [L,T,H] bf16 + ids [T] int32."""
 
@@ -63,7 +73,7 @@ class ShardData:
                     if e - s < block_size:
                         continue
                     yield (torch.from_numpy(ids[s:e].astype(np.int64)).to(device),
-                           torch.from_numpy(aux[:, s:e].astype(np.float32)).to(device).bfloat16())
+                           _aux_to_bf16(aux[:, s:e]).to(device))
 
     def eval_blocks(self, block_size: int, device, limit: int = 20000):
         got = 0
@@ -72,7 +82,7 @@ class ShardData:
             if T < block_size * 2:
                 continue
             yield (torch.from_numpy(ids[:T].astype(np.int64)).to(device),
-                   torch.from_numpy(aux[:, :T].astype(np.float32)).to(device).bfloat16())
+                   _aux_to_bf16(aux[:, :T]).to(device))
             got += T
             if got >= limit:
                 return
