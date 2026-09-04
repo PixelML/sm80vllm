@@ -26,6 +26,8 @@ import time
 # The worker extension module must be importable inside every worker process.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from pack_aux import PackError, pack_aux
+
 AUX_LAYERS = (5, 14, 24, 33, 42)  # dflash_config.target_layer_ids for GLM-5.3-Flash
 HIDDEN = 4096
 BYTES_PER_TOKEN = len(AUX_LAYERS) * HIDDEN * 2  # bf16
@@ -63,6 +65,12 @@ def preflight(need_datasets: bool) -> None:
             "preflight failed: specdec_worker_ext.py must sit beside this script "
             "(it is loaded by worker_extension_cls in every worker process)"
         )
+    # Prove the drain -> pack -> shard path off-GPU before paying for a weight
+    # load. Three attempts died after 8-12 minutes on post-load bugs; this is
+    # the cheapest possible guard against a fourth.
+    import test_drain_pack
+
+    test_drain_pack.main()
     print("[preflight] ok:", ", ".join(required))
 
 
@@ -177,6 +185,7 @@ def main() -> None:
     sp = SamplingParams(max_tokens=1, temperature=0.0)
 
     shard, shard_tokens, shard_idx = [], 0, 0
+    skipped = 0
     manifest = {"aux_layers": list(AUX_LAYERS), "hidden": HIDDEN,
                 "dtype": "bfloat16", "storage": "int16-view",
                 "model": args.model, "shards": []}
@@ -191,7 +200,17 @@ def main() -> None:
         states = next((c for c in captured if c), None)
         if not states:
             continue
-        stacked = np.stack([s for _, s in sorted(states, key=lambda x: x[0])])
+        # The hook fires per layer PER FORWARD PASS, so chunked prefill yields
+        # n_taps * n_chunks entries of differing token counts. pack_aux merges
+        # chunks per tap before stacking; see test_drain_pack.py.
+        try:
+            stacked = pack_aux(states, len(ids), len(AUX_LAYERS), HIDDEN)
+        except PackError as exc:
+            print(f"[skip] {exc}", flush=True)
+            skipped += 1
+            if skipped > 8 and not shard:
+                raise SystemExit(f"aborting: {skipped} consecutive pack failures")
+            continue
         shard.append({"ids": np.asarray(ids, dtype=np.int32), "aux": stacked})
         shard_tokens += len(ids)
         total += len(ids)
