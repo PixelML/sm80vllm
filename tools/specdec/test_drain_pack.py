@@ -82,13 +82,18 @@ def main() -> None:
             pass
         else:
             raise AssertionError(f"should have raised: {why}")
-    # token-count mismatch (a stray profiling forward)
+    # A padded batch (more rows than ids) is trimmed, not rejected: the runtime
+    # pads the forward pass (e.g. 628 ids captured as 768 rows) and the padding
+    # must not reach training.
+    trimmed = pack_aux(_fake_drain(20, [12, 8], rng), 19, TAPS, HIDDEN)
+    assert trimmed.shape == (TAPS, 19, HIDDEN), trimmed.shape
+    # Too FEW rows is still a hard error -- that means lost data.
     try:
-        pack_aux(_fake_drain(20, [12, 8], rng), 19, TAPS, HIDDEN)
+        pack_aux(_fake_drain(10, [10], rng), 11, TAPS, HIDDEN)
     except PackError as e:
         assert "token mismatch" in str(e), e
     else:
-        raise AssertionError("token mismatch not caught")
+        raise AssertionError("short capture not caught")
 
     # 5. End-to-end: several requests -> shard -> manifest -> reload.
     with tempfile.TemporaryDirectory() as td:

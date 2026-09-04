@@ -218,6 +218,8 @@ def main() -> None:
         max_model_len=args.max_len,
         limit_mm_per_prompt={"image": 0, "video": 0},
     )
+    raw_dir = str(out / "_raw")
+    llm.collective_rpc("set_aux_outdir", args=(raw_dir,))
     hooked = llm.collective_rpc("install_aux_hooks", args=(AUX_LAYERS,))
     print("[hooks]", hooked)
     if not any(isinstance(h, str) and h.startswith("hooked ") for h in hooked):
@@ -240,23 +242,25 @@ def main() -> None:
         if len(ids) < 32:
             continue
         llm.generate([{"prompt_token_ids": ids}], sp)
-        captured = llm.collective_rpc("drain_aux")
-        states = next((c for c in captured if c), None)
-        if not states:
+        # The worker packs and saves; only a small dict crosses the RPC.
+        meta = next(
+            (m for m in llm.collective_rpc(
+                "drain_and_save", args=(f"req{total:09d}", len(ids))) if m),
+            None,
+        )
+        if not meta:
             continue
         # The hook fires per layer PER FORWARD PASS, so chunked prefill yields
         # n_taps * n_chunks entries of differing token counts. pack_aux merges
         # chunks per tap before stacking; see test_drain_pack.py.
-        try:
-            stacked = pack_aux(states, len(ids), len(AUX_LAYERS), HIDDEN)
-        except Exception as exc:  # noqa: BLE001 - any failure must be dumpable
-            dump_failure(states, ids, exc, out)
-            raise SystemExit(
-                f"pack failed: {exc}\n"
-                "raw drain buffer written to the debug/ dir above; reproduce on "
-                "CPU with test_drain_pack.py --replay <file>, no weight load needed"
-            )
-        shard.append({"ids": np.asarray(ids, dtype=np.int32), "aux": stacked})
+        if tuple(meta["shape"]) != (len(AUX_LAYERS), len(ids), HIDDEN):
+            dump_failure(meta, ids, ValueError(f"bad shape {meta['shape']}"), out)
+            raise SystemExit(f"worker returned shape {meta['shape']}, expected "
+                             f"{(len(AUX_LAYERS), len(ids), HIDDEN)}")
+        stacked = np.load(meta["path"], mmap_mode="r")
+        shard.append({"ids": np.asarray(ids, dtype=np.int32),
+                      "aux": np.asarray(stacked)})
+        os.unlink(meta["path"])
         shard_tokens += len(ids)
         total += len(ids)
         if shard_tokens >= args.shard_tokens:

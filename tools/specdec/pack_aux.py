@@ -33,6 +33,28 @@ def describe(obj, depth: int = 0, max_depth: int = 4):
     return {"obj": type(obj).__name__}
 
 
+def _maybe_rebuild_ndarray(obj):
+    """Rebuild an ndarray that the RPC layer flattened into a triple.
+
+    vLLM's `collective_rpc` serializes numpy arrays with msgspec, which hands
+    back ``[dtype_str, [shape...], raw_bytes]`` rather than an ndarray. That
+    triple is what produced "inhomogeneous shape ... (3,)" in attempts 3 and 4
+    and "unexpected payload type str" in attempt 5 -- one cause, three
+    presentations. Returns None when `obj` is not such a triple.
+    """
+    if not (isinstance(obj, (list, tuple)) and len(obj) == 3):
+        return None
+    dtype, shape, buf = obj
+    if not (isinstance(dtype, str) and isinstance(shape, (list, tuple))):
+        return None
+    if not isinstance(buf, (bytes, bytearray, memoryview)):
+        return None
+    try:
+        return np.frombuffer(buf, dtype=np.dtype(dtype)).reshape(tuple(shape))
+    except (TypeError, ValueError) as exc:
+        raise PackError(f"could not rebuild ndarray {dtype} {shape}: {exc}") from exc
+
+
 def _as_2d_chunks(arr, hidden: int):
     """Yield [tokens, hidden] arrays from a payload that may be nested.
 
@@ -50,6 +72,10 @@ def _as_2d_chunks(arr, hidden: int):
             return
         raise PackError(f"unexpected ndarray shape {arr.shape} (hidden={hidden})")
     if isinstance(arr, (list, tuple)):
+        rebuilt = _maybe_rebuild_ndarray(arr)
+        if rebuilt is not None:
+            yield from _as_2d_chunks(rebuilt, hidden)
+            return
         for sub in arr:
             yield from _as_2d_chunks(sub, hidden)
         return
@@ -92,6 +118,12 @@ def pack_aux(states, n_tokens: int, n_taps: int, hidden: int) -> np.ndarray:
         raise PackError(f"taps disagree on token count after concat: {lens}")
 
     total = merged[0].shape[0]
+    if total > n_tokens:
+        # The forward pass runs on a padded batch (e.g. 628 ids captured as 768
+        # rows). Keep the real tokens; the padding carries no gradient signal
+        # and would poison training if stored.
+        merged = [m[:n_tokens] for m in merged]
+        total = n_tokens
     if total != n_tokens:
         # A profiling/dummy forward can pollute the buffer, and a truncated
         # request can shorten it. Both are silent-corruption bugs downstream, so

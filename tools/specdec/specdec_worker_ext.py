@@ -33,6 +33,40 @@ class SpecDecWorkerExtension:
             )
         return model, layers
 
+    def set_aux_outdir(self, out_dir: str) -> str:
+        self._specdec_outdir = out_dir
+        return out_dir
+
+    def drain_and_save(self, name: str, n_tokens: int) -> dict | None:
+        """Pack this request's aux states and write them on the WORKER.
+
+        Large arrays must never cross `collective_rpc`: msgspec encodes an
+        ndarray as ``[dtype, shape, flag]`` and drops the buffer, so the data
+        silently does not arrive (attempts 3-5). Returning a path plus metadata
+        keeps the RPC payload tiny and the bytes local.
+        """
+        import os
+
+        import numpy as np
+
+        from pack_aux import pack_aux
+
+        buf = getattr(self.model_runner.get_model(), AUX_BUF_ATTR, None)
+        if not buf:
+            return None
+        states = [(slot, t.numpy()) for slot, t in buf]
+        buf.clear()
+        out_dir = getattr(self, "_specdec_outdir", None)
+        if out_dir is None:
+            raise RuntimeError("set_aux_outdir was never called")
+        hidden = states[0][1].shape[-1]
+        n_taps = len({s for s, _ in states})
+        arr = pack_aux(states, n_tokens, n_taps, hidden)
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"{name}.npy")
+        np.save(path, arr)
+        return {"path": path, "shape": list(arr.shape), "dtype": str(arr.dtype)}
+
     def install_aux_hooks(self, layers: tuple[int, ...]) -> str:
         """Hook the target's decoder layers. Rank-0 only: under TP the hidden
         states are post-all-reduce and therefore identical on every rank."""
