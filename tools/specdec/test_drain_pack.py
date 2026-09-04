@@ -14,7 +14,7 @@ import tempfile
 
 import numpy as np
 
-from pack_aux import PackError, pack_aux
+from pack_aux import PackError, describe, pack_aux
 
 TAPS, HIDDEN = 5, 4096
 
@@ -33,6 +33,18 @@ def _fake_drain(n_tokens: int, chunks: list[int], rng):
         for slot in range(TAPS):
             out.append((slot, _bf16_int16((c, HIDDEN), rng)))
     return out
+
+
+def replay(path: str) -> None:
+    """Reproduce a real failure from a dumped drain buffer -- no GPU, no load."""
+    import pickle
+
+    with open(path, "rb") as fh:
+        blob = pickle.load(fh)
+    states, ids = blob["states"], blob["ids"]
+    print("structure:", json.dumps(describe(states))[:800])
+    out = pack_aux(states, len(ids), TAPS, HIDDEN)
+    print("packed OK:", out.shape, out.dtype)
 
 
 def main() -> None:
@@ -113,8 +125,49 @@ def main() -> None:
         except ImportError:
             pass
 
-    print("drain/pack test OK: chunked prefill, order, failure modes, shard round-trip")
+
+    # 6. Nested payloads. Attempt 4 died at np.asarray on a payload that was a
+    #    3-element inhomogeneous sequence, i.e. one entry per tap holding a LIST
+    #    of per-forward-pass arrays rather than a single array. Both layouts
+    #    must pack identically -- we should not have to know which the runtime
+    #    produces.
+    chunks = [2048, 2048, 1000]
+    n = sum(chunks)
+    nested = [(slot, [_bf16_int16((c, HIDDEN), rng) for c in chunks])
+              for slot in range(TAPS)]
+    got = pack_aux(nested, n, TAPS, HIDDEN)
+    assert got.shape == (TAPS, n, HIDDEN), got.shape
+
+    # 3-D array per tap (chunks already stacked by the runtime)
+    stacked3d = [(slot, np.stack([_bf16_int16((512, HIDDEN), rng) for _ in range(3)]))
+                 for slot in range(TAPS)]
+    assert pack_aux(stacked3d, 1536, TAPS, HIDDEN).shape == (TAPS, 1536, HIDDEN)
+
+    # nested order must be preserved
+    a = np.full((2, HIDDEN), 1, np.int16); b = np.full((3, HIDDEN), 2, np.int16)
+    packed = pack_aux([(s_, [a, b]) for s_ in range(TAPS)], 5, TAPS, HIDDEN)
+    assert (packed[0, :2] == 1).all() and (packed[0, 2:] == 2).all(), "nested order lost"
+
+    # 7. describe() must survive anything, since it runs inside the failure dump
+    for weird in (None, 3, "x", [], [[[np.zeros((1, 2))]]], (1, [2, 3])):
+        describe(weird)
+
+    # 8. A malformed entry must be reported, not crash numpy.
+    try:
+        pack_aux([np.zeros((4, HIDDEN))], 4, TAPS, HIDDEN)
+    except PackError as e:
+        assert "not (slot, payload)" in str(e), e
+    else:
+        raise AssertionError("malformed entry not caught")
+
+    print("drain/pack test OK: chunked prefill, nested payloads, order, "
+          "failure modes, shard round-trip")
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if len(sys.argv) > 2 and sys.argv[1] == "--replay":
+        replay(sys.argv[2])
+    else:
+        main()

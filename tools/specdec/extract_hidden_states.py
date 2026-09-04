@@ -33,6 +33,50 @@ HIDDEN = 4096
 BYTES_PER_TOKEN = len(AUX_LAYERS) * HIDDEN * 2  # bf16
 
 
+def dump_failure(states, ids, exc, out_dir) -> None:
+    """Persist the raw drain payload so the next fix needs no GPU.
+
+    Four extraction attempts have died after an 8-12 minute weight load. This
+    makes the fifth failure, if there is one, reproducible in seconds.
+    """
+    import json
+    import pickle
+
+    import numpy as np
+
+    from pack_aux import describe
+
+    dbg = pathlib.Path(out_dir).parent / "debug"
+    dbg.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%H%M%S")
+
+    meta = {
+        "error": f"{type(exc).__name__}: {exc}",
+        "n_ids": int(len(ids)),
+        "aux_layers": list(AUX_LAYERS),
+        "hidden": HIDDEN,
+        "structure": describe(states),
+    }
+    (dbg / f"structure-{stamp}.json").write_text(json.dumps(meta, indent=2))
+
+    # Raw payload, capped so a bad run cannot fill the disk.
+    def _nbytes(o):
+        if isinstance(o, np.ndarray):
+            return o.nbytes
+        if isinstance(o, (list, tuple)):
+            return sum(_nbytes(x) for x in o)
+        return 0
+
+    if _nbytes(states) <= 2 * 1024**3:
+        with open(dbg / f"drain-{stamp}.pkl", "wb") as fh:
+            pickle.dump({"states": states, "ids": np.asarray(ids)}, fh,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[debug] raw drain buffer -> {dbg}/drain-{stamp}.pkl", flush=True)
+    else:
+        print(f"[debug] payload > 2 GB, structure only -> {dbg}", flush=True)
+    print(f"[debug] structure: {json.dumps(meta['structure'])[:600]}", flush=True)
+
+
 def preflight(need_datasets: bool) -> None:
     """Check every import and the writability of the output BEFORE the engine
     loads 177 GiB of weights.
@@ -205,12 +249,13 @@ def main() -> None:
         # chunks per tap before stacking; see test_drain_pack.py.
         try:
             stacked = pack_aux(states, len(ids), len(AUX_LAYERS), HIDDEN)
-        except PackError as exc:
-            print(f"[skip] {exc}", flush=True)
-            skipped += 1
-            if skipped > 8 and not shard:
-                raise SystemExit(f"aborting: {skipped} consecutive pack failures")
-            continue
+        except Exception as exc:  # noqa: BLE001 - any failure must be dumpable
+            dump_failure(states, ids, exc, out)
+            raise SystemExit(
+                f"pack failed: {exc}\n"
+                "raw drain buffer written to the debug/ dir above; reproduce on "
+                "CPU with test_drain_pack.py --replay <file>, no weight load needed"
+            )
         shard.append({"ids": np.asarray(ids, dtype=np.int32), "aux": stacked})
         shard_tokens += len(ids)
         total += len(ids)

@@ -15,6 +15,47 @@ from __future__ import annotations
 import numpy as np
 
 
+def describe(obj, depth: int = 0, max_depth: int = 4):
+    """Structure of an arbitrarily nested drain payload, safe on anything.
+
+    Used both by the failure dump and by the tests, so the thing we inspect
+    after a failure is the same thing the tests assert on.
+    """
+    if depth > max_depth:
+        return "..."
+    if isinstance(obj, np.ndarray):
+        return {"ndarray": list(obj.shape), "dtype": str(obj.dtype)}
+    if isinstance(obj, (list, tuple)):
+        head = [describe(o, depth + 1, max_depth) for o in obj[:4]]
+        return {"seq": type(obj).__name__, "len": len(obj), "head": head}
+    if isinstance(obj, (int, float, str, bool)) or obj is None:
+        return {"scalar": type(obj).__name__, "value": obj}
+    return {"obj": type(obj).__name__}
+
+
+def _as_2d_chunks(arr, hidden: int):
+    """Yield [tokens, hidden] arrays from a payload that may be nested.
+
+    A tap's payload has arrived as a bare 2-D array, and (attempt 4) as a
+    sequence of per-forward-pass arrays. Handle both rather than guessing which
+    one the runtime will produce.
+    """
+    if isinstance(arr, np.ndarray):
+        if arr.ndim == 2 and arr.shape[-1] == hidden:
+            yield arr
+            return
+        if arr.ndim == 3 and arr.shape[-1] == hidden:
+            for sub in arr:
+                yield sub
+            return
+        raise PackError(f"unexpected ndarray shape {arr.shape} (hidden={hidden})")
+    if isinstance(arr, (list, tuple)):
+        for sub in arr:
+            yield from _as_2d_chunks(sub, hidden)
+        return
+    raise PackError(f"unexpected payload type {type(arr).__name__}")
+
+
 class PackError(ValueError):
     pass
 
@@ -29,13 +70,12 @@ def pack_aux(states, n_tokens: int, n_taps: int, hidden: int) -> np.ndarray:
         raise PackError("empty drain buffer: hooks fired zero times")
 
     by_slot: dict[int, list[np.ndarray]] = {}
-    for slot, arr in states:
-        a = np.asarray(arr)
-        if a.ndim != 2 or a.shape[-1] != hidden:
-            raise PackError(
-                f"tap {slot}: expected [tokens, {hidden}], got {a.shape}"
-            )
-        by_slot.setdefault(int(slot), []).append(a)
+    for entry in states:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            raise PackError(f"drain entry is not (slot, payload): {describe(entry)}")
+        slot, arr = entry
+        for chunk in _as_2d_chunks(arr, hidden):
+            by_slot.setdefault(int(slot), []).append(chunk)
 
     slots = sorted(by_slot)
     if slots != list(range(n_taps)):
