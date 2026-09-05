@@ -1142,6 +1142,9 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     if not is_weight and not is_scale:
         return False
     layer_prefix = name.rsplit(".wk.", 1)[0]
+    # PP: the layer lives on another rank — consume and skip.
+    if f"{layer_prefix}.wk_weights_proj.weight" not in params_dict:
+        return True
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
@@ -1234,6 +1237,9 @@ def _try_load_fp8_attn_proj(
     layer_prefix = name.rsplit(suffix, 1)[0]
     target_w = f"{layer_prefix}.{target_base}.weight"
     target_s = f"{layer_prefix}.{target_base}.weight_scale_inv"
+    # PP: the layer lives on another rank — consume and skip.
+    if target_w not in params_dict and target_s not in params_dict:
+        return True
     # If the model actually kept this projection in FP8, let the normal path
     # handle it (it has a weight_scale_inv param).
     if target_s in params_dict:
