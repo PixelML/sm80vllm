@@ -680,6 +680,18 @@ class Glm5NextModel(nn.Module):
         # means "after decoder layer k-1" (HF hidden_states[k]). Empty tuple =
         # disabled; the runner sets this via set_aux_hidden_state_layers().
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+        # Last-rank output staging for aux states. The forward's aux tensors
+        # are views over piecewise-cudagraph output buffers; under async
+        # scheduling the NEXT step's forward reuses those buffers before the
+        # drafter consumes them, clobbering every other step's aux (drafts
+        # alternate good/garbage, halving acceptance). Copy into persistent
+        # buffers INSIDE the forward -- the same trick DeepSeek-V4 uses for
+        # its MTP hidden buffer. Allocated lazily on the last rank at first
+        # aux-enabled forward (before any graph capture; warmup runs first).
+        self._aux_out_buffers: list[torch.Tensor] | None = None
+        self._max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
 
         if getattr(config, "mhc", False):
             n_streams = config.mhc_num_residual_streams
@@ -787,13 +799,21 @@ class Glm5NextModel(nn.Module):
                 )
             out = {"hidden_states": hidden_states}
             for k, aux in enumerate(aux_slots):
-                out[f"aux_hidden_{k}"] = (
-                    aux
-                    if aux is not None
-                    else hidden_states.new_zeros(
+                if aux is None:
+                    aux = hidden_states.new_zeros(
                         (hidden_states.shape[0], hidden_states.shape[-1])
                     )
-                )
+                else:
+                    # Locally collected aux is a view over piecewise-cudagraph
+                    # output buffers; under async scheduling the next forward
+                    # clobbers it before the NCCL hop completes (every other
+                    # step's aux turned to garbage downstream). The main
+                    # hidden_states hop is safe only because hc_post
+                    # materialization happens to allocate fresh; mirror that.
+                    # This runs outside captured regions, so the allocation is
+                    # harmless.
+                    aux = aux.clone()
+                out[f"aux_hidden_{k}"] = aux
             return IntermediateTensors(out)
 
         if self.is_sequence_parallel:
@@ -802,7 +822,23 @@ class Glm5NextModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         if aux_ids:
             assert all(a is not None for a in aux_slots)
-            return hidden_states, list(aux_slots)
+            if self._aux_out_buffers is None:
+                self._aux_out_buffers = [
+                    torch.zeros(
+                        (self._max_num_batched_tokens, hidden_states.shape[-1]),
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    )
+                    for _ in range(len(aux_ids))
+                ]
+            staged: list[torch.Tensor] = []
+            for k, aux in enumerate(aux_slots):
+                assert aux is not None
+                buf = self._aux_out_buffers[k]
+                n = aux.shape[0]
+                buf[:n].copy_(aux)
+                staged.append(buf[:n])
+            return hidden_states, staged
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
