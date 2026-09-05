@@ -65,6 +65,11 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+import os as _os_mb
+_PP_MAX_DECODE_REQS_PER_BATCH = int(
+    _os_mb.environ.get("VLLM_PP_MAX_DECODE_REQS_PER_BATCH", "0")
+)
+
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -485,10 +490,23 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        # PP micro-batching (170HX PP8): cap decode requests per batch so
+        # concurrent requests spread over the in-flight batch queue and all
+        # pipeline stages work simultaneously instead of one wide batch
+        # occupying a single slot. Skipped requests stay eligible next step.
+        num_decode_in_batch = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
             if input_budget <= draft_slots:
                 break
+            if (
+                _PP_MAX_DECODE_REQS_PER_BATCH > 0
+                and not request.is_prefill_chunk
+                and request.num_computed_tokens >= request.num_prompt_tokens
+                and num_decode_in_batch >= _PP_MAX_DECODE_REQS_PER_BATCH
+            ):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -648,6 +666,11 @@ class Scheduler(SchedulerInterface):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
+            if (
+                not request.is_prefill_chunk
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                num_decode_in_batch += 1
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
