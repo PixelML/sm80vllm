@@ -1027,7 +1027,9 @@ class Worker(WorkerBase):
         import time as _time
         _t0 = _time.perf_counter()
         _out = self.model_runner.sample_tokens(grammar_output)
-        _STAGE.add("sample_cpu", _time.perf_counter() - _t0)
+        _t1 = _time.perf_counter()
+        _STAGE.add("sample_cpu", _t1 - _t0)
+        _STAGE.trace("S", _t0, _t1)
         return _out
 
     @torch.inference_mode()

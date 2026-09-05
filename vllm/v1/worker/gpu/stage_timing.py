@@ -6,6 +6,7 @@ import torch
 
 _ENABLED = bool(os.environ.get("VLLM_STAGE_TIMING"))
 _REPORT_EVERY = int(os.environ.get("VLLM_STAGE_TIMING_EVERY", "64"))
+_TRACE_DIR = os.environ.get("VLLM_STAGE_TRACE")
 
 
 class StageTimer:
@@ -18,6 +19,27 @@ class StageTimer:
         self.draft_ev: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self._cur: dict[str, torch.cuda.Event] = {}
         self.rank = None
+        self._trace_fh = None
+        self._step_idx = 0
+
+    def _rank(self):
+        if self.rank is None:
+            try:
+                from vllm.distributed.parallel_state import get_pp_group
+
+                self.rank = get_pp_group().rank_in_group
+            except Exception:
+                self.rank = -1
+        return self.rank
+
+    def trace(self, kind: str, *vals: float) -> None:
+        if not _TRACE_DIR:
+            return
+        if self._trace_fh is None:
+            os.makedirs(_TRACE_DIR, exist_ok=True)
+            self._trace_fh = open(f"{_TRACE_DIR}/rank{self._rank()}.csv", "a")
+        self._trace_fh.write(f"{kind},{self._step_idx}," + ",".join(f"{v:.6f}" for v in vals) + "\n")
+        self._trace_fh.flush()
 
     def mark(self, k: str) -> None:
         if self.enabled:
@@ -39,6 +61,11 @@ class StageTimer:
             self._cur.clear()
             return
         t = self.t
+        self._step_idx += 1
+        try:
+            self.trace("E", t["entry"], t["fwd0"], t["fwd1"], t["exit"])
+        except KeyError:
+            pass
         try:
             wall = t["exit"] - t["entry"]
             recv = self.acc.pop("recv", 0.0)
