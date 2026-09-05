@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from drafter import DFlash2Drafter, DrafterConfig
+from drafter_v2 import DFlash2Drafter, DrafterConfig
 from eval_acceptance import acceptance_curve, predicted_tok_s
 
 
@@ -73,7 +73,7 @@ class ShardData:
                     if e - s < block_size:
                         continue
                     yield (torch.from_numpy(ids[s:e].astype(np.int64)).to(device),
-                           _aux_to_bf16(aux[:, s:e]).to(device))
+                           _aux_to_bf16(aux[:, s:e]).to(device).float())
 
     def eval_blocks(self, block_size: int, device, limit: int = 20000):
         got = 0
@@ -82,7 +82,7 @@ class ShardData:
             if T < block_size * 2:
                 continue
             yield (torch.from_numpy(ids[:T].astype(np.int64)).to(device),
-                   _aux_to_bf16(aux[:, :T]).to(device))
+                   _aux_to_bf16(aux[:, :T]).to(device).float())
             got += T
             if got >= limit:
                 return
@@ -106,7 +106,8 @@ def evaluate(model, data, cfg, device, depth: int) -> dict:
     for ids, aux in data.eval_blocks(cfg.block_size, device):
         x = masked_inputs(ids, cfg.block_size, cfg.mask_token_id)
         positions = torch.arange(ids.shape[0], device=device)
-        logits = model(x, aux, positions)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = model(x, aux, positions)
         pred = logits.argmax(-1)
         T = (ids.shape[0] // cfg.block_size) * cfg.block_size
         # Within a block, slot i predicts token i+1; keep the first `depth` of each.
@@ -144,7 +145,8 @@ def main() -> None:
 
     data = ShardData(args.data)
     cfg = DrafterConfig(block_size=args.block_size, target_layer_ids=tuple(data.aux_layers))
-    model = DFlash2Drafter(cfg).to(device).bfloat16()
+    # Params stay fp32 (master weights); math runs in bf16 under autocast.
+    model = DFlash2Drafter(cfg).to(device).float()
     if args.init_from:
         # Curriculum: block 8 -> 13 -> 17 reuses everything; only the conv's
         # position wrap depends on block_size, and that is not a parameter.
@@ -161,7 +163,7 @@ def main() -> None:
             raise SystemExit(f"{name}: checkpoint {tuple(w.shape)} vs model "
                              f"{tuple(mod.weight.shape)}")
         with torch.no_grad():
-            mod.weight.copy_(w.to(device).bfloat16())
+            mod.weight.copy_(w.to(device).float())
         mod.weight.requires_grad_(False)
     frozen_ref = {n: model.get_parameter(n).detach().clone()
                   for n in ("embed_tokens.weight", "lm_head.weight")}
@@ -190,7 +192,8 @@ def main() -> None:
         ids, aux = next(gen)
         x = masked_inputs(ids, cfg.block_size, cfg.mask_token_id)
         positions = torch.arange(ids.shape[0], device=device)
-        logits = model(x, aux, positions)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = model(x, aux, positions)
         # slot i predicts ids[i]; the target at each masked slot is its own token
         loss = F.cross_entropy(logits.float(), ids)
         opt.zero_grad(set_to_none=True)
