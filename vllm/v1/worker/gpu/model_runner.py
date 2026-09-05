@@ -27,6 +27,35 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm.triton_utils import tl, triton
+
+
+@triton.jit
+def _scatter_draft_tokens_kernel(
+    dst_ptr,
+    dst_stride,
+    src_ptr,
+    src_stride,
+    idx_ptr,
+    K,
+    BLOCK_K: tl.constexpr,
+):
+    """Row-scatter draft tokens by idx_mapping, skipping idx < 0 in-kernel.
+
+    Replaces `dst[idx[valid]] = src[valid]`: boolean-mask indexing calls
+    nonzero() under the hood, whose output size forces a device->host sync.
+    On every non-last PP rank, per step, those syncs serialize down the
+    pipeline and dominate the spec-decode step time.
+    """
+    r = tl.program_id(0)
+    idx = tl.load(idx_ptr + r)
+    if idx < 0:
+        return
+    offs = tl.arange(0, BLOCK_K)
+    mask = offs < K
+    vals = tl.load(src_ptr + r * src_stride + offs, mask=mask, other=0)
+    tl.store(dst_ptr + idx * dst_stride + offs, vals, mask=mask)
+
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -247,7 +276,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # = [40,41,42] of 43 layers) plus lm_head all land on that same
                 # last rank. eagle3/dflash keep the guard -- untested, and their
                 # aux layers are spread across ranks.
-                if self.use_pp and self.speculative_config.method != "dspark":
+                if self.use_pp and self.speculative_config.method not in ("dspark", "dflash"):
                     raise ValueError(
                         f"{self.speculative_config.method} with pipeline parallel "
                         "is not supported."
@@ -1072,10 +1101,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 idx_mapping = outputs["idx_mapping"]
                 self.postprocess_sampled(**outputs)
                 if draft_tokens is not None:
-                    valid = idx_mapping >= 0
-                    self.req_states.draft_tokens[idx_mapping[valid]] = draft_tokens[
-                        valid
-                    ]
+                    # Sync-free row scatter (see _scatter_draft_tokens_kernel):
+                    # invalid rows (idx_mapping < 0) are skipped in-kernel, so
+                    # no boolean-mask indexing (= nonzero + host sync) runs on
+                    # the per-step critical path of every non-last rank.
+                    num_rows, k = draft_tokens.shape
+                    if num_rows > 0:
+                        dst = self.req_states.draft_tokens
+                        src = draft_tokens.to(dst.dtype)
+                        _scatter_draft_tokens_kernel[(num_rows,)](
+                            dst,
+                            dst.stride(0),
+                            src,
+                            src.stride(0),
+                            idx_mapping,
+                            k,
+                            BLOCK_K=max(1, triton.next_power_of_2(k)),
+                        )
+                    import os as _os
+
+                    if _os.environ.get("VLLM_PP_DRAFT_DEBUG") == "1":
+                        if not hasattr(self, "_dbg_recv"):
+                            self._dbg_recv = 0
+                        if self._dbg_recv < 6 and draft_tokens.numel():
+                            self._dbg_recv += 1
+                            import torch.distributed as _dist
+
+                            print(
+                                f"[DRAFT_DBG recv rank={_dist.get_rank()}] "
+                                f"shape={tuple(draft_tokens.shape)} "
+                                f"row0={draft_tokens[0].tolist()}",
+                                flush=True,
+                            )
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:
