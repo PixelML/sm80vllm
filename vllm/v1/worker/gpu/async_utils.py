@@ -101,11 +101,15 @@ class StepTimingCollector:
             self._step.forward_end.record()
 
     def drafter_start(self) -> None:
+        from vllm.v1.worker.gpu.stage_timing import STAGE as _STAGE
+        _STAGE.event("d0")
         if self._step is not None:
             self._step.drafter_start.record()
 
     def drafter_end(self) -> None:
         """Ends the step: only steps that reach here have a draft cost."""
+        from vllm.v1.worker.gpu.stage_timing import STAGE as _STAGE
+        _STAGE.event("d1")
         if self._step is not None:
             self._step.drafter_end.record()
             self._timed.append((self._step, self._batch))

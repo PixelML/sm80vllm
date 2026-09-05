@@ -57,6 +57,7 @@ def _scatter_draft_tokens_kernel(
     tl.store(dst_ptr + idx * dst_stride + offs, vals, mask=mask)
 
 import vllm.envs as envs
+from vllm.v1.worker.gpu.stage_timing import STAGE as _STAGE
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
@@ -1600,6 +1601,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
 
+        _STAGE.mark("entry")
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
@@ -1794,6 +1796,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
         self.step_timing.forward_start()
+        _STAGE.mark("fwd0")
+        _STAGE.event("fwd0")
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -1835,6 +1839,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        _STAGE.event("fwd1")
+        _STAGE.mark("fwd1")
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)
@@ -1866,6 +1872,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             routed_experts=routed_experts,
         )
 
+        _STAGE.mark("exit")
+        _STAGE.end_step(dummy_run)
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
             return output_intermediate_tensors

@@ -115,8 +115,12 @@ class AsyncIntermediateTensors(IntermediateTensors):
         if self._comm_waited:
             return
         if self._comm_handles:
+            from vllm.v1.worker.gpu.stage_timing import STAGE as _STAGE
+            import time as _time
+            _t0 = _time.perf_counter()
             for handle in self._comm_handles:
                 handle.wait()
+            _STAGE.add("recv", _time.perf_counter() - _t0)
         if self._comm_postprocess:
             for fn in self._comm_postprocess:
                 fn()
@@ -1019,7 +1023,12 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        from vllm.v1.worker.gpu.stage_timing import STAGE as _STAGE
+        import time as _time
+        _t0 = _time.perf_counter()
+        _out = self.model_runner.sample_tokens(grammar_output)
+        _STAGE.add("sample_cpu", _time.perf_counter() - _t0)
+        return _out
 
     @torch.inference_mode()
     @with_gpu_sync_check
