@@ -16,10 +16,12 @@ The strongest assertion is the last: every token id stored in the shards must
 equal the corpus that was fed in, request for request. That is the invariant the
 whole batched path exists to protect.
 
-  docker run --rm -v <worktree>/tools/specdec:/tools -v /library/models:/library/models \
+  docker run --rm -v <tools>:/tools -v <data>:/data \
+    -e DRYRUN_CORPUS=/data/sliceB \
     -w /tools --entrypoint python3 <image> /tools/test_extract_dryrun.py
 """
 import json
+import os
 import pathlib
 import shutil
 import sys
@@ -32,8 +34,9 @@ sys.path.insert(0, "/tools")
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 
 HIDDEN = 64          # keep the dry run small; the driver reads E.HIDDEN
-ARCHIVE = ("/library/models/archive/vm215-2026-09-05/"
-           "specdec-data-sliceA-INVALID-deferred-tap/sliceA")
+# Any existing extraction directory works as a corpus source; the dry run only
+# reads its token ids. Set DRYRUN_CORPUS to one.
+ARCHIVE = os.environ.get("DRYRUN_CORPUS", "/data/sliceB")
 
 
 class StubLLM:
