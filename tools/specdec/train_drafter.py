@@ -329,15 +329,22 @@ def main() -> None:
             print(f"[eval {step}] per_token={m['per_token_acceptance']} "
                   f"alpha={m['mean_accepted_length']} "
                   f"per-pos={m['per_position_conditional'][:5]}", flush=True)
-            torch.save(model.state_dict(), out / "latest.pt")
+            # Save the EXPORTED set only. model.state_dict() also carries the
+            # frozen embed_tokens and lm_head -- 5 GB of every 9.8 GB checkpoint
+            # that is a byte-for-byte copy of target-shared.safetensors, which
+            # the loader already has. Six runs x latest+best was 114 GB of
+            # duplicated frozen weights. --init-from loads with strict=False and
+            # the shared weights are loaded separately afterwards, so a
+            # checkpoint without them restores identically.
+            torch.save(model.export_state_dict(), out / "latest.pt")
             if m["per_token_acceptance"] > best:
                 best = m["per_token_acceptance"]
-                torch.save(model.state_dict(), out / "best.pt")
+                torch.save(model.export_state_dict(), out / "best.pt")
             (out / f"acceptance-{step}.json").write_text(json.dumps(m, indent=2))
 
     m = evaluate(model, data, cfg, device, depth, args.eval_blocks, args.ctx_window)
     print("[final]", json.dumps(m, indent=2))
-    torch.save(model.state_dict(), out / "latest.pt")
+    torch.save(model.export_state_dict(), out / "latest.pt")
 
     from safetensors.torch import save_file
     save_file({k: v.contiguous().to(torch.bfloat16)
