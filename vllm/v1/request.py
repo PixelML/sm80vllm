@@ -171,8 +171,6 @@ class Request:
         self.last_sched_seq = 0
 
         self.spec_token_ids: list[int] = []
-        # EMA of accepted draft tokens per step (adaptive spec truncation).
-        self.spec_accept_ema: float = 8.0
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
