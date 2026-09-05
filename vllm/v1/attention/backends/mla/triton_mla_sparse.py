@@ -48,8 +48,11 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
             return
         device = self.topk_indices_buffer.device
         topk = self.topk_indices_buffer.shape[-1]
-        q = torch.empty(1, self.num_heads, _DIM_QK, dtype=torch.bfloat16, device=device)
-        kv = torch.empty(64, 1, _DIM_QK, dtype=torch.bfloat16, device=device)
+        # NoPE models (GLM-5.3-Flash) run dim_qk=512; warm up the variant the
+        # layer will actually launch instead of the DeepSeek 576 default.
+        dim_qk = getattr(self, "head_size", None) or _DIM_QK
+        q = torch.empty(1, self.num_heads, dim_qk, dtype=torch.bfloat16, device=device)
+        kv = torch.empty(64, 1, dim_qk, dtype=torch.bfloat16, device=device)
         indices = torch.zeros(1, 1, topk, dtype=torch.int32, device=device)
         for splits in KV_SPLITS_CANDIDATES:
             triton_mla_sparse_attention(
@@ -89,6 +92,12 @@ class TritonMLASparseBackend(XPUMLASparseBackend):
     @staticmethod
     def get_name() -> str:
         return "TRITON_MLA_SPARSE"
+
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        # 576: DeepSeek-V3.2 / GLM-5 (512 + 64 rope). 512: NoPE sparse MLA
+        # (GLM-5.3-Flash, qk_rope_head_dim=0).
+        return [512, 576]
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
