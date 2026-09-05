@@ -50,10 +50,10 @@ fi
 # ---- 3. push tools (ALWAYS -- node 2's copy is stale) ----------------------
 say "syncing specdec-tools"
 if [ "$NODE" = "1" ]; then
-  rsync -a --delete "$TOOLS/" apollo:~/specdec-tools/
+  rsync -a --delete --exclude __pycache__ --omit-dir-times "$TOOLS/" apollo:~/specdec-tools/
 else
-  rsync -a --delete "$TOOLS/" apollo:~/specdec-tools/
-  ssh -o ConnectTimeout=20 apollo "rsync -a --delete ~/specdec-tools/ apollo-2:~/specdec-tools/"
+  rsync -a --delete --exclude __pycache__ --omit-dir-times "$TOOLS/" apollo:~/specdec-tools/
+  ssh -o ConnectTimeout=20 apollo "rsync -a --delete --exclude __pycache__ --omit-dir-times ~/specdec-tools/ apollo-2:~/specdec-tools/"
 fi
 SH "ls ~/specdec-tools/ref_eval2.py ~/specdec-tools/drafter_v2.py >/dev/null" \
   || { echo "tools sync failed"; exit 1; }
@@ -78,7 +78,7 @@ SH "cd ~/specdec-data && sha256sum -c SHARED.sha256 --quiet" \
   || { echo "target-shared CHECKSUM MISMATCH on $H -- do not train"; exit 1; }
 say "checksums OK"
 
-SH "python3 -c \"import json,sys; m=json.load(open('\$HOME/specdec-data/sliceB/manifest.json')); t=m.get('aux_tap'); n=sum(s['tokens'] for s in m['shards']); print('tap',t,'tokens',n,'shards',len(m['shards'])); sys.exit(0 if t=='hc_post-materialized+stream-mean' and n>400000 else 1)\"" \
+SH "python3 ~/specdec-tools/verify_manifest.py ~/specdec-data/sliceB 400000" \
   || { echo "manifest on $H is not the corrected-tap slice B"; exit 1; }
 
 if [ "$DRY" = "1" ]; then say "DRY=1, preflight passed, starting nothing"; exit 0; fi
