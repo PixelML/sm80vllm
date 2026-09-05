@@ -584,6 +584,7 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.ALWAYS
     supports_update_block_table = False
     reorder_batch_threshold = None
+    supports_draft_decode_metadata_update = True
 
     def __init__(
         self,
@@ -596,6 +597,10 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         # compressed_slot_mapping) -- the tail is storage-only and exports only
         # slot_mapping, which is rebuilt per step from the group's block table.
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # Inputs of the last build(), for the fused-draft-loop refresh: the
+        # common metadata's tensors are views over runner buffers that the
+        # fused loop advances in place between draft steps.
+        self._last_common_metadata: CommonAttentionMetadata | None = None
 
     def build(
         self,
@@ -606,6 +611,7 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(common_attn_metadata)
         )
+        self._last_common_metadata = common_attn_metadata
         slot_mapping = common_attn_metadata.slot_mapping
         positions = common_attn_metadata.positions
         if positions is not None:
@@ -630,6 +636,31 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
             num_prefill_tokens=num_prefill_tokens,
             prefill=None,
             decode=None,
+        )
+
+    def update_draft_decode_metadata(
+        self, metadata: DeepseekV32IndexerMetadata
+    ) -> None:
+        # Between fused draft steps only the circular tail slots move (they
+        # depend on the per-token positions, which the fused loop advanced in
+        # place); seq_lens is already a view over the advanced runner buffer.
+        common = self._last_common_metadata
+        if common is None or metadata.num_decode_tokens == 0:
+            return
+        if common.positions is None:
+            # Mirror build(): without positions (dummy/profile runs) the raw
+            # per-group slot mapping is exported unchanged, and it is already
+            # a view over the runner buffer the fused loop refreshes.
+            metadata.slot_mapping = common.slot_mapping
+            return
+        metadata.slot_mapping = compute_kpool_tail_slot_mapping(
+            common.slot_mapping,
+            common.block_table_tensor,
+            common.query_start_loc,
+            common.positions,
+            common.num_actual_tokens,
+            common.num_reqs,
+            self.kv_cache_spec.block_size,
         )
 
 
@@ -685,6 +716,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        # Fused multi-step draft decode: between draft steps only seq_lens
+        # (advanced in place by the fused loop), the derived compressed
+        # seq_lens, and the compressed slot mapping change; everything else in
+        # the decode metadata (expanded block tables, decode_lens, buffer
+        # views) is step-invariant for the 1-token-per-request draft batch.
+        # update_draft_decode_metadata() refreshes exactly those, so declare
+        # support unless a CP mode we haven't audited is active.
+        self.supports_draft_decode_metadata_update = (
+            self.dcp_world_size == 1 and not self.use_pcp
+        )
+        self._last_common_metadata: CommonAttentionMetadata | None = None
+        self._last_indexer_block_table: torch.Tensor | None = None
         # The DCP sparse-indexer code is parameterized by interleave size, but
         # interleave > 1 is not yet validated end-to-end (gsm8k parity fails),
         # so fail closed here rather than silently produce wrong output.
@@ -1090,6 +1133,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
             compressed_seq_lens = seq_lens // self.compress_ratio
 
+        self._last_common_metadata = common_attn_metadata
+        self._last_indexer_block_table = indexer_block_table
+
         prefill_metadata = None
         if num_prefills > 0:
             # This CPU value is an upper bound for async-spec extend rows.  It
@@ -1326,6 +1372,61 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
         return attn_metadata
+
+    def update_draft_decode_metadata(
+        self, metadata: DeepseekV32IndexerMetadata
+    ) -> None:
+        """Refresh step-dependent decode metadata between fused draft steps.
+
+        The fused draft loop advances the runner's seq_lens / positions /
+        slot-mapping buffers in place; the metadata's tensor fields are views
+        over either those buffers or this builder's persistent buffers. For
+        the draft batch (pure decode, exactly one token per request) the only
+        derived state to recompute is:
+          - decode_seq_lens_buffer (token-granular per-row bound == seq_len)
+          - expanded_seq_lens_buffer (pool-granular, seq_len // compress_ratio)
+          - the compressed slot mapping (position-dependent pool slots)
+          - the DeepGEMM paged-MQA schedule, where that path is in use
+        Expanded block tables and decode_lens are step-invariant.
+        """
+        decode = metadata.decode
+        common = self._last_common_metadata
+        if decode is None or common is None or metadata.num_decode_tokens == 0:
+            return
+        num_tokens = metadata.num_decode_tokens
+        # Fused drafting only ever presents a uniform 1-token-per-request
+        # decode batch; anything else means this hook is being used outside
+        # its contract and the refresh below would be wrong.
+        assert metadata.num_prefills == 0 and num_tokens == metadata.num_decodes, (
+            "update_draft_decode_metadata expects a pure 1-token-per-request "
+            f"decode batch, got num_prefills={metadata.num_prefills} "
+            f"num_decode_tokens={num_tokens} num_decodes={metadata.num_decodes}"
+        )
+        seq_lens = common.seq_lens[:num_tokens]
+        self.decode_seq_lens_buffer[:num_tokens].copy_(seq_lens)
+        if self.compress_ratio > 1:
+            torch.floor_divide(
+                seq_lens,
+                self.compress_ratio,
+                out=self.expanded_seq_lens_buffer[:num_tokens],
+            )
+            assert self._last_indexer_block_table is not None
+            get_compressed_slot_mapping(
+                num_tokens,
+                common.query_start_loc,
+                common.seq_lens,
+                self._last_indexer_block_table,
+                self.kv_cache_spec.storage_block_size,
+                self.compress_ratio,
+                out=self.compressed_slot_mapping_buffer,
+            )
+        if current_platform.is_cuda() and is_deep_gemm_supported():
+            self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
+                decode.seq_lens,
+                self.kv_cache_spec.storage_block_size,
+                self.num_sms,
+                indices=decode.indices,
+            )
 
 
 def build_prefill_chunk_metadata(

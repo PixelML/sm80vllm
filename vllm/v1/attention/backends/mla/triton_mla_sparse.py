@@ -28,6 +28,16 @@ class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
     # XPU base keeps NEVER (not validated under cudagraph); this subclass
     # claims UNIFORM_BATCH for the CUDA/Triton path.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # Draft decode (1 token/request) needs no per-step refresh here: the
+    # metadata's tensors (query_start_loc / slot_mapping / block_table) are
+    # views over runner buffers the fused draft loop advances in place, and
+    # req_id_per_token plus the size fields are step-invariant. Declaring
+    # support keeps this builder from forcing the speculator back to a full
+    # metadata rebuild between draft steps.
+    supports_draft_decode_metadata_update = True
+
+    def update_draft_decode_metadata(self, metadata) -> None:
+        return
 
 
 class TritonMLASparseImpl(XPUMLASparseImpl):
