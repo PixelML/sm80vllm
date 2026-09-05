@@ -165,6 +165,27 @@ def main() -> None:
     else:
         raise AssertionError("malformed entry not caught")
 
+    # 9. Shared-weight contract. Run 1 trained embed_tokens and lm_head and then
+    #    dropped them at export, leaving the layers tuned against a head they
+    #    would never be served with. The trainable set must equal the exported
+    #    set, and the reference checkpoint pins that at ~1.17B.
+    try:
+        import torch
+
+        from drafter import DFlash2Drafter, DrafterConfig
+
+        m = DFlash2Drafter(DrafterConfig())
+        m.embed_tokens.weight.requires_grad_(False)
+        m.lm_head.weight.requires_grad_(False)
+        trainable = sum(p_.numel() for p_ in m.parameters() if p_.requires_grad)
+        exported = sum(v.numel() for v in m.export_state_dict().values())
+        assert trainable == exported, (trainable, exported)
+        assert 1.0e9 < trainable < 1.35e9, trainable
+        assert not any(k.startswith(("model.embed_tokens", "lm_head"))
+                       for k in m.export_state_dict())
+    except ImportError:
+        pass
+
     print("drain/pack test OK: chunked prefill, nested payloads, order, "
           "failure modes, shard round-trip")
 
