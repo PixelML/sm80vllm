@@ -336,6 +336,14 @@ def main() -> None:
         worker_extension_cls="specdec_worker_ext.SpecDecWorkerExtension",
         tensor_parallel_size=args.tp,
         enforce_eager=True,
+        # MUST be off. With prefix caching on, vLLM does not recompute cached
+        # prefix tokens, so the forward hooks see only the uncached suffix: a
+        # 2944-token request produced 640 rows and the pack aborted. It also
+        # perturbs batch scheduling enough to break the submission-order
+        # assumption the batched split relies on. Extraction needs every token
+        # recomputed; the eval recipe passes --no-enable-prefix-caching for its
+        # own reasons and this lane needs it for correctness.
+        enable_prefix_caching=False,
         gpu_memory_utilization=0.85,
         max_model_len=args.max_len,
         limit_mm_per_prompt={"image": 0, "video": 0},
@@ -429,6 +437,7 @@ def main() -> None:
         # The hook fires per layer PER FORWARD PASS, so chunked prefill yields
         # n_taps * n_chunks entries of differing token counts. pack_aux merges
         # chunks per tap before stacking; see test_drain_pack.py.
+        nonlocal skipped
         for ids in group:
             llm.generate([{"prompt_token_ids": ids}], sp)
             meta = next(
@@ -436,8 +445,15 @@ def main() -> None:
                     "drain_and_save", args=(f"req{total:09d}", len(ids))) if m),
                 None,
             )
-            if meta:
+            if meta and not meta.get("error"):
                 accept(ids, meta)
+                skipped = 0
+            else:
+                skipped += 1
+                why = (meta or {}).get("error", "no rows drained")
+                print(f"[skip] request of {len(ids)} tokens: {why}", flush=True)
+                if skipped >= 8:
+                    raise SystemExit("8 consecutive unpackable requests; aborting")
 
     stream = encode_stream()
     head = []

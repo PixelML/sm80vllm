@@ -67,12 +67,27 @@ class SpecDecWorkerExtension:
             return None
         states = [(slot, t.numpy()) for slot, t in buf]
         buf.clear()
+        # The id tap must be cleared here too. It is not read on the serial
+        # path, but leaving it to grow means the NEXT batched drain sees every
+        # id from every serial request before it -- observed as "captured 17378
+        # ids, submitted 8715", which then fails verification and forces serial
+        # again, permanently. One missed clear turned a fallback into a latch.
+        ids_buf = getattr(self.model_runner.get_model(), AUX_IDS_ATTR, None)
+        if ids_buf is not None:
+            ids_buf.clear()
         out_dir = getattr(self, "_specdec_outdir", None)
         if out_dir is None:
             raise RuntimeError("set_aux_outdir was never called")
         hidden = states[0][1].shape[-1]
         n_taps = len({s for s, _ in states})
-        arr = pack_aux(states, n_tokens, n_taps, hidden)
+        try:
+            arr = pack_aux(states, n_tokens, n_taps, hidden)
+        except Exception as exc:
+            # Raising here propagates out of collective_rpc and kills the
+            # engine, losing the whole window over one bad request. With ~900
+            # sequences, dropping a few is free; the driver counts consecutive
+            # skips and aborts at 8.
+            return {"error": f"{type(exc).__name__}: {exc}"}
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"{name}.npy")
         np.save(path, arr)
@@ -113,7 +128,10 @@ class SpecDecWorkerExtension:
 
         hidden = states[0][1].shape[-1]
         n_taps = len({s for s, _ in states})
-        arr = pack_aux(states, total, n_taps, hidden)
+        try:
+            arr = pack_aux(states, total, n_taps, hidden)
+        except Exception as exc:
+            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
 
         out_dir = getattr(self, "_specdec_outdir", None)
         if out_dir is None:
