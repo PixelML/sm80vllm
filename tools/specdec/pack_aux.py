@@ -136,3 +136,48 @@ def pack_aux(states, n_tokens: int, n_taps: int, hidden: int) -> np.ndarray:
     if out.shape != (n_taps, n_tokens, hidden):
         raise PackError(f"bad final shape {out.shape}")
     return out
+
+
+def verify_ids(captured_chunks, lengths, ids_flat):
+    """Prove a batched capture can be split per request. Pure CPU, no vLLM.
+
+    `captured_chunks` are the per-forward-pass input_id arrays in pass order.
+    Concatenated they must equal `ids_flat`, the submitted ids of the batch laid
+    end to end in submission order; `lengths` then splits them. Returns None on
+    success, or a string naming the first disagreement.
+
+    This is the whole safety argument for batched extraction. The tap rows and
+    these ids share one token axis within a forward pass, so if the ids split
+    correctly the hidden states do too. Without it we would be assuming that the
+    scheduler emits requests in submission order and never interleaves a chunked
+    prefill -- an assumption of exactly the kind that has already broken here
+    once (chunked prefill, attempt 3), and whose failure produces data that
+    trains cleanly and never reaches acceptance.
+    """
+    if not captured_chunks:
+        return "no input_ids captured"
+    got = np.concatenate([np.asarray(c).reshape(-1) for c in captured_chunks])
+    want = np.asarray(ids_flat).reshape(-1)
+    total = int(sum(int(x) for x in lengths))
+    if got.shape[0] != total:
+        return f"captured {got.shape[0]} ids, submitted {total}"
+    if want.shape[0] != total:
+        return f"ids_flat has {want.shape[0]} entries, lengths sum to {total}"
+    if not np.array_equal(got.astype(np.int64), want.astype(np.int64)):
+        bad = int(np.flatnonzero(got.astype(np.int64) != want.astype(np.int64))[0])
+        return (f"id stream differs at row {bad} (got {int(got[bad])}, "
+                f"want {int(want[bad])}); batch order or chunking is not what "
+                "the cumsum split assumes")
+    return None
+
+
+def split_batch(arr, lengths):
+    """Split a packed [taps, total_tokens, hidden] batch into per-request views."""
+    total = int(sum(int(x) for x in lengths))
+    if arr.shape[1] != total:
+        raise PackError(f"packed {arr.shape[1]} rows, lengths sum to {total}")
+    out, off = [], 0
+    for n in (int(x) for x in lengths):
+        out.append(arr[:, off:off + n])
+        off += n
+    return out

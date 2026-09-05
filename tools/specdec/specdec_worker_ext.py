@@ -11,6 +11,7 @@ Must be importable inside the container: put this file's directory on PYTHONPATH
 from __future__ import annotations
 
 AUX_BUF_ATTR = "_specdec_buf"
+AUX_IDS_ATTR = "_specdec_ids"
 AUX_HANDLE_ATTR = "_specdec_handles"
 
 
@@ -32,6 +33,16 @@ class SpecDecWorkerExtension:
                 f"updating for {type(model).__name__}"
             )
         return model, layers
+
+    def _specdec_inner(self, model):
+        inner = model
+        for attr in ("language_model", "model"):
+            nxt = getattr(inner, attr, None)
+            if nxt is not None:
+                inner = nxt
+                if hasattr(inner, "layers"):
+                    break
+        return inner
 
     def set_aux_outdir(self, out_dir: str) -> str:
         self._specdec_outdir = out_dir
@@ -67,6 +78,55 @@ class SpecDecWorkerExtension:
         np.save(path, arr)
         return {"path": path, "shape": list(arr.shape), "dtype": str(arr.dtype)}
 
+    def drain_and_save_batch(self, names, lengths, ids_flat) -> dict | None:
+        """Pack a whole BATCH, split it per request, and PROVE the split.
+
+        Returns {"ok": True, "metas": [...]} only when the captured input_ids,
+        split by cumsum of `lengths`, equal `ids_flat` exactly for every request.
+        Otherwise {"ok": False, "reason": ...} and the caller re-runs the batch
+        one prompt at a time. The invariant runs on EVERY batch, not once: it
+        costs an int comparison, and the thing it rules out is unrecoverable and
+        silent.
+        """
+        import os
+
+        import numpy as np
+
+        from pack_aux import pack_aux, split_batch, verify_ids
+
+        model = self.model_runner.get_model()
+        buf = getattr(model, AUX_BUF_ATTR, None)
+        ids_buf = getattr(model, AUX_IDS_ATTR, None)
+        if not buf:
+            return None
+        states = [(slot, t.numpy()) for slot, t in buf]
+        captured = list(ids_buf or [])
+        buf.clear()
+        if ids_buf is not None:
+            ids_buf.clear()
+
+        lengths = [int(x) for x in lengths]
+        total = sum(lengths)
+        bad = verify_ids(captured, lengths, ids_flat)
+        if bad is not None:
+            return {"ok": False, "reason": bad}
+
+        hidden = states[0][1].shape[-1]
+        n_taps = len({s for s, _ in states})
+        arr = pack_aux(states, total, n_taps, hidden)
+
+        out_dir = getattr(self, "_specdec_outdir", None)
+        if out_dir is None:
+            raise RuntimeError("set_aux_outdir was never called")
+        os.makedirs(out_dir, exist_ok=True)
+        metas = []
+        for name, n, piece in zip(names, lengths, split_batch(arr, lengths)):
+            path = os.path.join(out_dir, f"{name}.npy")
+            np.save(path, piece)
+            metas.append({"path": path, "shape": [n_taps, n, hidden],
+                          "name": name, "tokens": n})
+        return {"ok": True, "metas": metas, "verified_ids": int(total)}
+
     def install_aux_hooks(self, layers: tuple[int, ...]) -> str:
         """Hook the target's decoder layers. Rank-0 only: under TP the hidden
         states are post-all-reduce and therefore identical on every rank."""
@@ -79,6 +139,30 @@ class SpecDecWorkerExtension:
         model, decoder_layers = self._specdec_decoder_layers()
         buf: list = []
         setattr(model, AUX_BUF_ATTR, buf)
+
+        # Capture the input_ids of every forward pass, in pass order, from a
+        # pre-hook on the embedding. This is what makes BATCHED extraction safe:
+        # the tap rows and these ids share one token axis in one forward, so if a
+        # cumsum split of the ids reproduces each submitted request exactly, the
+        # split of the hidden states is correct too -- proven per batch, not
+        # assumed. Mis-pairing states with tokens is the one failure mode in this
+        # lane that trains cleanly and never reaches acceptance, so it gets a
+        # check rather than an argument.
+        ids_buf: list = []
+        setattr(model, AUX_IDS_ATTR, ids_buf)
+        embed = None
+        for holder in (self._specdec_inner(model), model):
+            embed = getattr(holder, "embed_tokens", None)
+            if embed is not None:
+                break
+        if embed is None:
+            raise RuntimeError("specdec: could not find embed_tokens for the id tap")
+
+        def ids_hook(_module, args):
+            if args and hasattr(args[0], "detach"):
+                ids_buf.append(args[0].detach().to("cpu").numpy().reshape(-1).copy())
+
+        id_handle = embed.register_forward_pre_hook(ids_hook)
 
         if getattr(model, "is_sequence_parallel", False) or any(
             getattr(l, "is_sequence_parallel", False) for l in decoder_layers
@@ -127,8 +211,8 @@ class SpecDecWorkerExtension:
             for n, i in enumerate(layers)
             if i < len(decoder_layers)
         ]
-        setattr(model, AUX_HANDLE_ATTR, handles)
-        return f"hooked {len(handles)} layers of {len(decoder_layers)}"
+        setattr(model, AUX_HANDLE_ATTR, handles + [id_handle])
+        return f"hooked {len(handles)} layers of {len(decoder_layers)} + input_ids"
 
     def drain_aux(self) -> list:
         model = self.model_runner.get_model()

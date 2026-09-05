@@ -85,6 +85,38 @@ def dump_failure(states, ids, exc, out_dir) -> None:
     print(f"[debug] structure: {json.dumps(meta['structure'])[:600]}", flush=True)
 
 
+
+def load_corpus_from_shards(root: str, n_tokens: int) -> list[list[int]]:
+    """Replay a previous extraction's exact token id sequences.
+
+    Re-extracting the same prompts makes the new dataset directly comparable
+    with the old one -- the aux tap is then the only thing that changed between
+    them, which is what the 2.5% -> ~36% claim needs in order to mean anything.
+    It also removes the `datasets` dependency and any network access from the
+    GPU window, and cannot drift through a tokenizer round-trip.
+    """
+    import numpy as np
+
+    src = pathlib.Path(root)
+    files = sorted(src.glob("shard-*.npz"))
+    if not files:
+        raise SystemExit(f"no shard-*.npz in {src}")
+    seqs, got = [], 0
+    for f in files:
+        z = np.load(f)
+        n = sum(1 for k in z.files if k.startswith("ids_"))
+        for i in range(n):
+            ids = z[f"ids_{i}"].astype(np.int64).tolist()
+            seqs.append(ids)
+            got += len(ids)
+            if got >= n_tokens:
+                print(f"[corpus] replaying {len(seqs)} sequences / {got} tokens "
+                      f"from {src}")
+                return seqs
+    print(f"[corpus] replaying {len(seqs)} sequences / {got} tokens from {src}")
+    return seqs
+
+
 def preflight(need_datasets: bool) -> None:
     """Check every import and the writability of the output BEFORE the engine
     loads 177 GiB of weights.
@@ -189,6 +221,59 @@ def load_corpus(n_tokens: int, tokenizer) -> list[str]:
     return texts
 
 
+
+def submit_batch(llm, sp, batch, tag, aux_layers, hidden):
+    """One batched generate + verified drain. Returns metas, or None if the
+    per-batch id check failed (caller falls back to serial)."""
+    llm.generate([{"prompt_token_ids": ids} for ids in batch], sp)
+    names = [f"{tag}_{i:04d}" for i in range(len(batch))]
+    lengths = [len(x) for x in batch]
+    ids_flat = [int(t) for x in batch for t in x]
+    res = next(
+        (r for r in llm.collective_rpc(
+            "drain_and_save_batch", args=(names, lengths, ids_flat)) if r),
+        None,
+    )
+    if not res:
+        return None
+    if not res.get("ok"):
+        print(f"[batch {tag}] id verification FAILED: {res.get('reason')}", flush=True)
+        return None
+    for meta, n in zip(res["metas"], lengths):
+        if tuple(meta["shape"]) != (len(aux_layers), n, hidden):
+            print(f"[batch {tag}] bad shape {meta['shape']} for {n} tokens", flush=True)
+            return None
+    return res["metas"]
+
+
+def batch_selfcheck(llm, sp, encoded, aux_layers, hidden):
+    """Three requests of deliberately different lengths, in ONE batch, before any
+    bulk work. Proves the cumsum split reproduces every submitted request exactly.
+
+    Runs in the GPU window but costs seconds. If it fails, the run drops to the
+    serial path and the window still produces usable data -- just less of it.
+    """
+    picks = sorted(encoded, key=len)
+    if len(picks) < 3:
+        return False
+    trio = [picks[0], picks[len(picks) // 2], picks[-1]]
+    if len({len(x) for x in trio}) < 3:
+        return False
+    print(f"[selfcheck] 3 requests of lengths {[len(x) for x in trio]} in one batch",
+          flush=True)
+    metas = submit_batch(llm, sp, trio, "selfcheck", aux_layers, hidden)
+    if metas is None:
+        print("[selfcheck] FAILED -> serial extraction", flush=True)
+        return False
+    import os
+    for m in metas:
+        os.unlink(m["path"])
+    print(f"[selfcheck] PASS: ids reconstructed exactly for all 3 requests, "
+          f"row counts {[m['tokens'] for m in metas]} -> batched extraction",
+          flush=True)
+    return True
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="/models/model-cache/glm-5.3-flash-awq-w4a16")
@@ -197,17 +282,34 @@ def main() -> None:
     ap.add_argument("--tp", type=int, default=4)
     ap.add_argument("--max-len", type=int, default=4096)
     ap.add_argument("--shard-tokens", type=int, default=50_000)
+    ap.add_argument("--batch-size", type=int, default=8,
+                    help="requests per generate call. Batching is ~7x, and is "
+                         "safe only because every batch is id-verified; a batch "
+                         "that fails verification is re-run one prompt at a time.")
+    ap.add_argument("--batch-tokens", type=int, default=8192,
+                    help="token budget per batch; keep <= max_num_batched_tokens "
+                         "so a batch is one forward pass where possible")
+    ap.add_argument("--no-batch", action="store_true",
+                    help="force the serial path (~110 tok/s) without trying the "
+                         "self-check")
     ap.add_argument("--resume", action="store_true",
                     help="continue a partially extracted directory: keep existing "
                          "shards, skip the corpus rows already consumed, and append. "
                          "Lets one long extraction be taken across several short "
                          "GPU windows instead of needing one uninterrupted run.")
+    ap.add_argument("--corpus-from-shards",
+                    help="replay the EXACT token id sequences of a previous "
+                         "extraction directory. Makes the new dataset "
+                         "prompt-for-prompt comparable with the old one (only "
+                         "the aux tap changes), needs neither `datasets` nor "
+                         "network, and avoids a tokenizer round-trip.")
     ap.add_argument("--corpus-jsonl", help="pre-tokenizable JSONL "
                     "(one object per line, \"text\" or \"messages\"); "
                     "avoids the `datasets` dependency entirely")
     args = ap.parse_args()
 
-    preflight(need_datasets=args.corpus_jsonl is None)
+    preflight(need_datasets=args.corpus_jsonl is None
+              and args.corpus_from_shards is None)
 
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -238,9 +340,14 @@ def main() -> None:
     if not any(isinstance(h, str) and h.startswith("hooked ") for h in hooked):
         raise SystemExit(f"refusing: no rank installed hooks ({hooked})")
 
-    tok = llm.get_tokenizer()
-    texts = (load_corpus_jsonl(args.corpus_jsonl, args.tokens, tok)
-             if args.corpus_jsonl else load_corpus(args.tokens, tok))
+    replay_ids = None
+    if args.corpus_from_shards:
+        replay_ids = load_corpus_from_shards(args.corpus_from_shards, args.tokens)
+        texts = []
+    else:
+        tok = llm.get_tokenizer()
+        texts = (load_corpus_jsonl(args.corpus_jsonl, args.tokens, tok)
+                 if args.corpus_jsonl else load_corpus(args.tokens, tok))
     sp = SamplingParams(max_tokens=1, temperature=0.0)
 
     shard, shard_tokens, shard_idx = [], 0, 0
@@ -274,23 +381,20 @@ def main() -> None:
 
     t0 = time.time()
     total = 0
-    for text in texts:
-        consumed += 1
-        ids = tok.encode(text)[: args.max_len]
-        if len(ids) < 32:
-            continue
-        llm.generate([{"prompt_token_ids": ids}], sp)
-        # The worker packs and saves; only a small dict crosses the RPC.
-        meta = next(
-            (m for m in llm.collective_rpc(
-                "drain_and_save", args=(f"req{total:09d}", len(ids))) if m),
-            None,
-        )
-        if not meta:
-            continue
-        # The hook fires per layer PER FORWARD PASS, so chunked prefill yields
-        # n_taps * n_chunks entries of differing token counts. pack_aux merges
-        # chunks per tap before stacking; see test_drain_pack.py.
+
+    def encode_stream():
+        nonlocal consumed
+        source = replay_ids if replay_ids is not None else texts
+        for item in source:
+            consumed += 1
+            enc = (list(item) if replay_ids is not None
+                   else tok.encode(item))[: args.max_len]
+            if len(enc) >= 32:
+                yield enc
+
+    def accept(ids, meta):
+        """Shared by both paths: shape-check, load, append to the shard."""
+        nonlocal shard_tokens, total
         if tuple(meta["shape"]) != (len(AUX_LAYERS), len(ids), HIDDEN):
             dump_failure(meta, ids, ValueError(f"bad shape {meta['shape']}"), out)
             raise SystemExit(f"worker returned shape {meta['shape']}, expected "
@@ -301,6 +405,49 @@ def main() -> None:
         os.unlink(meta["path"])
         shard_tokens += len(ids)
         total += len(ids)
+
+    def run_serial(group):
+        # The hook fires per layer PER FORWARD PASS, so chunked prefill yields
+        # n_taps * n_chunks entries of differing token counts. pack_aux merges
+        # chunks per tap before stacking; see test_drain_pack.py.
+        for ids in group:
+            llm.generate([{"prompt_token_ids": ids}], sp)
+            meta = next(
+                (m for m in llm.collective_rpc(
+                    "drain_and_save", args=(f"req{total:09d}", len(ids))) if m),
+                None,
+            )
+            if meta:
+                accept(ids, meta)
+
+    stream = encode_stream()
+    head = []
+    batched = False
+    if not args.no_batch:
+        for enc in stream:
+            head.append(enc)
+            if len(head) >= 24:
+                break
+        batched = batch_selfcheck(llm, sp, head, AUX_LAYERS, HIDDEN)
+
+    import itertools
+    pending = []
+    for ids in itertools.chain(head, stream):
+        if not batched:
+            run_serial([ids])
+        else:
+            pending.append(ids)
+            if (len(pending) >= args.batch_size
+                    or sum(len(x) for x in pending) >= args.batch_tokens):
+                metas = submit_batch(llm, sp, pending, f"b{total:09d}",
+                                     AUX_LAYERS, HIDDEN)
+                if metas is None:
+                    print("[batch] falling back to serial for this group", flush=True)
+                    run_serial(pending)
+                else:
+                    for enc, meta in zip(pending, metas):
+                        accept(enc, meta)
+                pending = []
         if shard_tokens >= args.shard_tokens:
             path = out / f"shard-{shard_idx:04d}.npz"
             np.savez(path, **{f"ids_{i}": s["ids"] for i, s in enumerate(shard)},
@@ -317,9 +464,25 @@ def main() -> None:
         if total >= args.tokens:
             break
 
+    if pending:
+        metas = submit_batch(llm, sp, pending, f"b{total:09d}", AUX_LAYERS, HIDDEN)
+        if metas is None:
+            run_serial(pending)
+        else:
+            for enc, meta in zip(pending, metas):
+                accept(enc, meta)
+    if shard:
+        path = out / f"shard-{shard_idx:04d}.npz"
+        np.savez(path, **{f"ids_{i}": s2["ids"] for i, s2 in enumerate(shard)},
+                 **{f"aux_{i}": s2["aux"] for i, s2 in enumerate(shard)})
+        manifest["shards"].append({"file": path.name, "tokens": shard_tokens,
+                                   "samples": len(shard)})
+        shard_idx += 1
     manifest["texts_consumed"] = consumed
     man_path.write_text(json.dumps(manifest, indent=2))
-    print(f"[done] +{total} tokens, {shard_idx} shards total -> {out}")
+    print(f"[done] +{total} tokens, {shard_idx} shards total, "
+          f"{'batched' if batched else 'serial'}, "
+          f"{total / max(time.time() - t0, 1e-9):.0f} tok/s -> {out}")
 
 
 if __name__ == "__main__":

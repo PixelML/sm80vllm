@@ -186,6 +186,52 @@ def main() -> None:
     except ImportError:
         pass
 
+    # ---- batched split + id verification -------------------------------
+    # Batched extraction is ~7x. Its entire safety argument is that every batch
+    # proves its own split, so these run in preflight with everything else.
+    from pack_aux import split_batch, verify_ids
+
+    rng2 = np.random.default_rng(7)
+    lengths = [37, 5, 128]                     # deliberately different lengths
+    reqs = [rng2.integers(0, 1000, n).astype(np.int64) for n in lengths]
+    ids_flat = np.concatenate(reqs)
+
+    # one forward pass for the whole batch
+    assert verify_ids([ids_flat], lengths, ids_flat) is None
+    # chunked: the batch arrives as several passes, concatenating in order
+    chunks = [ids_flat[:20], ids_flat[20:100], ids_flat[100:]]
+    assert verify_ids(chunks, lengths, ids_flat) is None
+    # wrong total
+    assert verify_ids([ids_flat[:-1]], lengths, ids_flat) is not None
+    # right total, wrong ORDER -- the failure that must never pass silently
+    swapped = np.concatenate([reqs[1], reqs[0], reqs[2]])
+    bad = verify_ids([swapped], lengths, ids_flat)
+    assert bad is not None and "differs at row" in bad, bad
+    # a single transposed pair anywhere in the stream
+    perturbed = ids_flat.copy()
+    perturbed[60], perturbed[61] = perturbed[61], perturbed[60]
+    if perturbed[60] != perturbed[61]:
+        assert verify_ids([perturbed], lengths, ids_flat) is not None
+
+    # split_batch must hand back exactly the submitted row counts, in order
+    taps, hidden = 5, 8
+    packed = np.arange(taps * sum(lengths) * hidden, dtype=np.int16).reshape(
+        taps, sum(lengths), hidden)
+    pieces = split_batch(packed, lengths)
+    assert [p.shape[1] for p in pieces] == lengths
+    assert np.array_equal(np.concatenate(pieces, axis=1), packed)
+    off = 0
+    for piece, n in zip(pieces, lengths):
+        assert np.array_equal(piece, packed[:, off:off + n])
+        off += n
+    try:
+        split_batch(packed, [1, 2])
+        raise AssertionError("split_batch accepted mismatched lengths")
+    except PackError:
+        pass
+
+    print("batched split/verify OK: order, chunking, totals, transposition, "
+          "per-request row counts")
     print("drain/pack test OK: chunked prefill, nested payloads, order, "
           "failure modes, shard round-trip")
 
