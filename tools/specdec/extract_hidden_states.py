@@ -387,7 +387,14 @@ def main() -> None:
         done = sum(s["tokens"] for s in prev["shards"])
         print(f"[resume] {shard_idx} shards, {done} tokens, "
               f"skipping {consumed} corpus rows already consumed")
-        texts = texts[consumed:]
+        # Skip on whichever source is actually feeding the run. `--corpus-from-shards`
+        # leaves `texts` empty and puts the sequences in `replay_ids`; slicing only
+        # `texts` silently skipped nothing and re-extracted the whole corpus,
+        # doubling the dataset (caught by test_extract_dryrun.py).
+        if replay_ids is not None:
+            replay_ids = replay_ids[consumed:]
+        else:
+            texts = texts[consumed:]
     elif args.resume:
         print(f"[resume] no manifest in {out}; starting fresh")
 
