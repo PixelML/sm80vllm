@@ -181,3 +181,90 @@ def split_batch(arr, lengths):
         out.append(arr[:, off:off + n])
         off += n
     return out
+
+
+class Ambiguous(PackError):
+    """Two requests could claim the same rows; the assignment is not provable."""
+
+
+def resolve_segments(captured_chunks, lengths, ids_flat):
+    """Assign captured rows to requests by token-id CONTENT, not submission order.
+
+    Returns a list of index arrays, one per request, giving the rows of the
+    concatenated capture that belong to it -- or raises PackError/Ambiguous.
+
+    Why not submission order: the scheduler reorders requests within a batch.
+    The 3-request self-check passed while every 8-request group failed with
+    matching totals, which is exactly what reordering looks like.
+
+    Why content matching is not automatically safe: two requests that share a
+    long leading run (a chat template preamble, say) can both match at a segment
+    start, and picking the wrong one pairs a request with ANOTHER request's
+    hidden states while every token id still checks out. So this resolves each
+    segment by longest match and REFUSES when the longest match is tied -- a
+    refusal costs the batched speedup, a wrong guess costs the dataset.
+
+    The caller must still treat the returned assignment as a claim to verify:
+    `verify_assignment` re-checks every row against the request it was given to.
+    """
+    got = np.concatenate([np.asarray(c).reshape(-1) for c in captured_chunks]).astype(np.int64)
+    reqs, off = [], 0
+    for n in (int(x) for x in lengths):
+        reqs.append(np.asarray(ids_flat[off:off + n], dtype=np.int64))
+        off += n
+    if off != got.shape[0]:
+        raise PackError(f"captured {got.shape[0]} rows, requests total {off}")
+
+    progress = [0] * len(reqs)
+    rows = [[] for _ in reqs]
+    i = 0
+    while i < got.shape[0]:
+        best, best_len, tied = -1, 0, False
+        for r, seq in enumerate(reqs):
+            k = progress[r]
+            if k >= seq.shape[0] or seq[k] != got[i]:
+                continue
+            # maximal run this request could claim starting at i
+            m = 0
+            while (k + m < seq.shape[0] and i + m < got.shape[0]
+                   and seq[k + m] == got[i + m]):
+                m += 1
+            if m > best_len:
+                best, best_len, tied = r, m, False
+            elif m == best_len and m > 0:
+                tied = True
+        if best_len == 0:
+            raise PackError(
+                f"no request can claim row {i} (token {int(got[i])}); "
+                "the capture does not correspond to the submitted batch")
+        if tied:
+            raise Ambiguous(
+                f"row {i}: two requests match equally for {best_len} tokens; "
+                "cannot prove which one owns these hidden states")
+        rows[best].extend(range(i, i + best_len))
+        progress[best] += best_len
+        i += best_len
+
+    for r, seq in enumerate(reqs):
+        if progress[r] != seq.shape[0]:
+            raise PackError(
+                f"request {r} matched {progress[r]} of {seq.shape[0]} tokens")
+    return [np.asarray(x, dtype=np.int64) for x in rows]
+
+
+def verify_assignment(captured_chunks, lengths, ids_flat, assignment):
+    """Re-check an assignment row by row. None on success, else a message."""
+    got = np.concatenate([np.asarray(c).reshape(-1) for c in captured_chunks]).astype(np.int64)
+    off = 0
+    for r, n in enumerate((int(x) for x in lengths)):
+        want = np.asarray(ids_flat[off:off + n], dtype=np.int64)
+        idx = assignment[r]
+        if idx.shape[0] != n:
+            return f"request {r}: assigned {idx.shape[0]} rows, expected {n}"
+        if not np.array_equal(got[idx], want):
+            return f"request {r}: assigned rows do not reproduce its token ids"
+        off += n
+    seen = np.concatenate(assignment) if assignment else np.zeros(0, np.int64)
+    if seen.shape[0] != got.shape[0] or np.unique(seen).shape[0] != got.shape[0]:
+        return "assignment does not partition the captured rows exactly once"
+    return None

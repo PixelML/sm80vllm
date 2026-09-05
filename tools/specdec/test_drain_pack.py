@@ -230,6 +230,66 @@ def main() -> None:
     except PackError:
         pass
 
+    # ---- content-based segment resolution (reordering-tolerant) ---------
+    from pack_aux import Ambiguous, resolve_segments, verify_assignment
+
+    rng3 = np.random.default_rng(11)
+    L = [37, 5, 128]
+    R = [rng3.integers(100, 1000, n).astype(np.int64) for n in L]
+    flat = np.concatenate(R)
+
+    def ok(chunks, tag):
+        a = resolve_segments(chunks, L, flat)
+        assert verify_assignment(chunks, L, flat, a) is None, tag
+        return a
+
+    # in submission order, one pass
+    a = ok([flat], "in-order")
+    assert [x.shape[0] for x in a] == L
+    # requests emitted in a DIFFERENT order -- the case that broke the window
+    ok([np.concatenate([R[2], R[0], R[1]])], "reordered")
+    # chunked AND interleaved across passes
+    ok([np.concatenate([R[1], R[2][:60]]), np.concatenate([R[0], R[2][60:]])],
+       "chunked + interleaved")
+    # a request split across three passes, out of order
+    ok([R[2][:40], np.concatenate([R[0], R[2][40:90]]),
+        np.concatenate([R[1], R[2][90:]])], "three-way split")
+
+    # shared prefix must still resolve: the runs diverge, longest match wins
+    pre = rng3.integers(100, 1000, 24).astype(np.int64)
+    S = [np.concatenate([pre, rng3.integers(100, 1000, 30).astype(np.int64)]),
+         np.concatenate([pre, rng3.integers(100, 1000, 40).astype(np.int64)])]
+    SL = [s_.shape[0] for s_ in S]
+    sflat = np.concatenate(S)
+    a = resolve_segments([np.concatenate([S[1], S[0]])], SL, sflat)
+    assert verify_assignment([np.concatenate([S[1], S[0]])], SL, sflat, a) is None
+    print("  shared-prefix requests resolved by longest match")
+
+    # TWO IDENTICAL requests must be REFUSED, not guessed: the ids would check
+    # out either way while the hidden states would be swapped.
+    dup = rng3.integers(100, 1000, 50).astype(np.int64)
+    dflat = np.concatenate([dup, dup])
+    try:
+        resolve_segments([dflat], [50, 50], dflat)
+        raise AssertionError("identical requests were silently disambiguated")
+    except Ambiguous:
+        pass
+    print("  identical requests refused (Ambiguous), not guessed")
+
+    # a capture that does not correspond to the batch at all
+    try:
+        resolve_segments([rng3.integers(5000, 6000, sum(L)).astype(np.int64)], L, flat)
+        raise AssertionError("foreign capture accepted")
+    except PackError:
+        pass
+    # a deliberately wrong assignment must be caught by verify_assignment
+    bad = [np.arange(0, 37), np.arange(37, 42), np.arange(42, 170)]
+    bad[0], bad[1] = bad[1], np.arange(0, 37)[:5]
+    assert verify_assignment([flat], L, flat, bad) is not None
+
+    print("segment resolution OK: reorder, chunk+interleave, three-way split, "
+          "shared prefix, identical-request refusal, foreign capture")
+
     print("batched split/verify OK: order, chunking, totals, transposition, "
           "per-request row counts")
     print("drain/pack test OK: chunked prefill, nested payloads, order, "

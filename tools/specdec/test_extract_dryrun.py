@@ -72,15 +72,25 @@ class StubLLM:
         return np.stack([np.full((len(ids), HIDDEN), 0, dtype=np.int16)
                          for _ in range(5)]) + tag[None, :, None]
 
+    REORDER = True   # emit requests in a DIFFERENT order than submitted
+
     def _drain_batch(self, names, lengths, ids_flat):
-        from pack_aux import split_batch, verify_ids
-        captured = [np.asarray(p) for p in self._pending]   # one pass per request
-        bad = verify_ids(captured, lengths, ids_flat)
+        from pack_aux import Ambiguous, PackError, resolve_segments, verify_assignment
+        order = list(range(len(self._pending)))
+        if self.REORDER and len(order) > 2:
+            order = order[::-1]                    # scheduler reordering
+        emitted = [self._pending[i] for i in order]
+        captured = [np.asarray(p) for p in emitted]
+        try:
+            assignment = resolve_segments(captured, lengths, ids_flat)
+        except (Ambiguous, PackError) as exc:
+            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+        bad = verify_assignment(captured, lengths, ids_flat, assignment)
         if bad is not None:
             return {"ok": False, "reason": bad}
-        arr = np.concatenate([self._rows(p) for p in self._pending], axis=1)
+        arr = np.concatenate([self._rows(p) for p in emitted], axis=1)
         metas = []
-        for name, n, piece in zip(names, lengths, split_batch(arr, lengths)):
+        for name, n, piece in zip(names, lengths, [arr[:, i] for i in assignment]):
             path = str(pathlib.Path(self.outdir) / f"{name}.npy")
             np.save(path, piece)
             metas.append({"path": path, "shape": [5, n, HIDDEN], "name": name,

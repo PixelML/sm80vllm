@@ -107,7 +107,8 @@ class SpecDecWorkerExtension:
 
         import numpy as np
 
-        from pack_aux import pack_aux, split_batch, verify_ids
+        from pack_aux import (Ambiguous, PackError, pack_aux,
+                              resolve_segments, verify_assignment)
 
         model = self.model_runner.get_model()
         buf = getattr(model, AUX_BUF_ATTR, None)
@@ -122,7 +123,16 @@ class SpecDecWorkerExtension:
 
         lengths = [int(x) for x in lengths]
         total = sum(lengths)
-        bad = verify_ids(captured, lengths, ids_flat)
+        # Resolve rows to requests by token-id CONTENT. The scheduler reorders
+        # requests within a batch, so submission order is not a safe assumption
+        # -- assuming it is what made every bulk group fail while the 3-request
+        # self-check passed. resolve_segments refuses rather than guesses when
+        # two requests could own the same rows.
+        try:
+            assignment = resolve_segments(captured, lengths, ids_flat)
+        except (Ambiguous, PackError) as exc:
+            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+        bad = verify_assignment(captured, lengths, ids_flat, assignment)
         if bad is not None:
             return {"ok": False, "reason": bad}
 
@@ -138,7 +148,8 @@ class SpecDecWorkerExtension:
             raise RuntimeError("set_aux_outdir was never called")
         os.makedirs(out_dir, exist_ok=True)
         metas = []
-        for name, n, piece in zip(names, lengths, split_batch(arr, lengths)):
+        pieces = [arr[:, idx] for idx in assignment]
+        for name, n, piece in zip(names, lengths, pieces):
             path = os.path.join(out_dir, f"{name}.npy")
             np.save(path, piece)
             metas.append({"path": path, "shape": [n_taps, n, hidden],
