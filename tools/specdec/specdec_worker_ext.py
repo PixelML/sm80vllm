@@ -80,9 +80,41 @@ class SpecDecWorkerExtension:
         buf: list = []
         setattr(model, AUX_BUF_ATTR, buf)
 
+        if getattr(model, "is_sequence_parallel", False) or any(
+            getattr(l, "is_sequence_parallel", False) for l in decoder_layers
+        ):
+            raise RuntimeError(
+                "specdec: sequence parallelism is on; the aux tap would capture "
+                "an SP shard. Relaunch without sequence-parallel MoE."
+            )
+
         def make_hook(slot: int):
-            def hook(_module, _args, output):
-                hs = output[0] if isinstance(output, tuple) else output
+            def hook(module, _args, output):
+                # MUST match Glm5NextModel.forward's aux tap exactly:
+                #     aux = layer.hc_post(hidden_states, residual, post, comb)
+                #           if post is not None else hidden_states
+                #     if aux.dim() == 3: aux = aux.mean(dim=1)
+                # The raw layer output is the DEFERRED mHC state: every layer
+                # but the last defers its hc_post to the next layer's fused
+                # pre, so output[0] is missing that layer's MLP contribution
+                # and is not stream-contracted. Capturing it (as the first
+                # slice-A extraction did) yields a tensor that looks plausible
+                # on its own -- it still predicts the next token through
+                # lm_head -- but is NOT what the drafter's `fc` was trained on.
+                # Reference DFlash2 scores 2.5% per-token on states captured
+                # that way, against 36-39% in serving.
+                if isinstance(output, tuple):
+                    hs = output[0]
+                    if len(output) >= 4 and output[2] is not None:
+                        hs = module.hc_post(output[0], output[1], output[2], output[3])
+                else:
+                    hs = output
+                if hs.dim() == 3:
+                    hs = hs.mean(dim=1)
+                if hs.dim() != 2:
+                    raise RuntimeError(
+                        f"specdec: aux tap produced dim={hs.dim()}, expected 2"
+                    )
                 # numpy has no bfloat16, so keep the exact bits as int16 and
                 # reinterpret on load. Casting to float16 would overflow.
                 buf.append(

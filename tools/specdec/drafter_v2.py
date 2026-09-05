@@ -1,18 +1,36 @@
-"""DFlash2 block drafter, v2 — parameter layout matching the reference exactly.
+"""DFlash2 block drafter — forward TRANSCRIBED from the serving stack.
 
-v1 was a reimplementation from the blog description and did NOT match: 4 conv
-modules per layer instead of 2, fused gate_up instead of split, no hidden_norm,
-selector named `selector` instead of `candidate_selector`. Only 47 of 81/95
-tensors were common, so v1's checkpoints could never load in vLLM's
-`DFlash2DraftModel` path.
+Source of record (byte-identical between the port image
+`ghcr.io/pixelml/club-170hx:vllm-glm53-sm80-pp-20260905` and the specdec worktree):
 
-The reference shapes decode the design: `base_kernel [2, 2, H]` is
-(pre/post, taps, hidden) and `kernel_projection [4*G, H]` is
-(pre/post x taps x groups), so the two-tap conv IS applied before and after each
-sublayer -- but the two kernels live in ONE module per sublayer, not two.
+  vllm/model_executor/models/qwen3_dflash2.py   `_grouped_conv`, `DFlashGroupedConv`,
+                                                `DFlash2Qwen3DecoderLayer.forward`,
+                                                `_score_edges`, `CandidateSelector`
+  vllm/model_executor/models/qwen3_dflash.py    `DFlashQwen3Attention.forward`,
+                                                `DFlashQwen3Model.forward`,
+                                                `_project_context_kv`,
+                                                `_normalize_context_k`,
+                                                `precompute_and_store_context_kv`
 
-Acceptance test for this file is `--strict-load <reference>`: if their
-checkpoint loads with strict=True, the layout is right by construction.
+Names are kept parallel to the source so the diff is reviewable.
+
+THE SHAPE OF THE COMPUTATION (this is what v1 and the first v2 both got wrong):
+
+  * The fused aux hidden states are CONTEXT ONLY. They are turned straight into
+    per-layer K/V by `precompute_and_store_context_kv` -- hidden_norm, then the
+    layer's k_proj/v_proj, then k_norm, then RoPE at the token's absolute
+    position -- and written into the draft's KV cache. They never pass through
+    a decoder layer, and EVERY layer's context K/V derives from the SAME
+    `context_states`.
+  * Only the `1 + D` query slots run the layer stack: anchor (last accepted
+    token id) + D mask tokens, at contiguous positions t+1 .. t+D.
+  * Consequently the conv's `block_size` is `1 + num_speculative_tokens` (the
+    query block), the conv only ever sees query rows, and the residual stream is
+    carried separately in vLLM's fused add-RMSNorm convention.
+
+Acceptance test for this file: `ref_eval2.py` with the reference checkpoint must
+land near 36% per-token on cached AWQ hidden states. 0% means the forward is
+still wrong; ~90% means the target has leaked into the input.
 """
 from __future__ import annotations
 
@@ -34,13 +52,19 @@ class DrafterConfig:
     vocab_size: int = 154880
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
-    sliding_window: int = 2048
+    is_neox_style: bool = True
+    sliding_window: int | None = 2048
+    causal: bool = False            # config.is_causal == false
+    # `block_size` in the checkpoint config is the drafter's trained block; the
+    # conv's block_size is the QUERY block, 1 + num_speculative_tokens.
     block_size: int = 8
-    conv_kernel_size: int = 2
+    num_speculative_tokens: int = 7
+    conv_kernel_size: int = 2       # taps
     conv_group_size: int = 16
     selector_rank: int = 256
     selector_top_k: int = 16
     mask_token_id: int = 154856
+    input_embedding_scale: float = 1.0
     target_layer_ids: tuple[int, ...] = (5, 14, 24, 33, 42)
     num_target_layers: int = 45
 
@@ -48,100 +72,200 @@ class DrafterConfig:
     def num_groups(self) -> int:
         return self.hidden_size // self.conv_group_size
 
+    @property
+    def conv_block_size(self) -> int:
+        # qwen3_dflash2.py: block_size=1 + speculative_config.num_speculative_tokens
+        return 1 + self.num_speculative_tokens
+
 
 class RMSNorm(nn.Module):
+    """vLLM `RMSNorm`, both call shapes.
+
+    forward(x)           -> normed
+    forward(x, residual) -> (normed, residual) with residual := residual + x
+    """
+
     def __init__(self, dim: int, eps: float):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
+        self.variance_epsilon = eps
 
-    def forward(self, x):
-        dt = x.dtype
-        y = x.float()
-        y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + self.eps)
-        return y.to(dt) * self.weight
+    def forward(self, x, residual=None):
+        orig_dtype = x.dtype
+        y = x.to(torch.float32)
+        if residual is not None:
+            y = y + residual.to(torch.float32)
+            residual = y.to(orig_dtype)
+        y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+        out = y.to(orig_dtype) * self.weight
+        if residual is None:
+            return out
+        return out, residual
 
 
-class DynamicConv(nn.Module):
-    """Two-tap dynamic depthwise conv, holding BOTH the pre and post kernels.
+# ---------------------------------------------------------------------------
+# qwen3_dflash2.py  ::  _grouped_conv / DFlashGroupedConv   (verbatim)
+# ---------------------------------------------------------------------------
 
-    base_kernel: [2 (pre/post), taps, hidden]
-    kernel_projection: [2 * taps * groups, hidden]
+def _grouped_conv(
+    hidden_states: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: int,
+    num_groups: int,
+    group_size: int,
+    taps: int,
+) -> torch.Tensor:
+    blocks = hidden_states.unflatten(-1, (num_groups, group_size))
+    coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+    output = coefficients[:, 0] * blocks
+    position = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+    if block_size & (block_size - 1) == 0:
+        position = position & (block_size - 1)
+    else:
+        position = position % block_size
+    for tap in range(1, taps):
+        shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+        output = output + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+    return output.flatten(-2)
+
+
+class DFlashGroupedConv(nn.Module):
+    def __init__(self, cfg: DrafterConfig) -> None:
+        super().__init__()
+        hidden_size = cfg.hidden_size
+        group_size = cfg.conv_group_size
+        if hidden_size % group_size:
+            raise ValueError(
+                f"conv_group_size={group_size} must divide hidden_size={hidden_size}."
+            )
+        self.block_size = cfg.conv_block_size
+        self.taps = cfg.conv_kernel_size
+        self.group_size = group_size
+        self.num_groups = hidden_size // group_size
+        self.base_kernel = nn.Parameter(torch.zeros(2, self.taps, hidden_size))
+        with torch.no_grad():
+            self.base_kernel[:, 0].fill_(1.0)
+        self.kernel_projection = nn.Linear(
+            hidden_size, 2 * self.taps * self.num_groups, bias=False
+        )
+
+    def _convolve(self, hidden_states, delta, side: int):
+        return _grouped_conv(
+            hidden_states,
+            delta,
+            self.base_kernel[side],
+            self.block_size,
+            self.num_groups,
+            self.group_size,
+            self.taps,
+        )
+
+    def prepare(self, hidden_states):
+        """BOTH coefficient sets come from ONE projection of the PRE-sublayer
+        state; the post set is carried across the sublayer by the caller."""
+        coefficients = self.kernel_projection(hidden_states).reshape(
+            hidden_states.shape[0], 2, self.taps, self.num_groups
+        )
+        return self._convolve(hidden_states, coefficients[:, 0], 0), coefficients[:, 1]
+
+    def finish(self, hidden_states, coefficients):
+        return self._convolve(hidden_states, coefficients, 1)
+
+
+# ---------------------------------------------------------------------------
+# qwen3_dflash.py  ::  DFlashQwen3Attention                (query path only)
+# ---------------------------------------------------------------------------
+
+def _rope_cos_sin(positions, theta: float, head_dim: int, device, dtype=torch.float32):
+    """vLLM `RotaryEmbedding` table: inv_freq = base ** (-arange(0,d,2)/d)."""
+    inv_freq = theta ** (
+        -torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim
+    )
+    ang = positions.to(torch.float32)[:, None] * inv_freq[None, :]
+    return ang.cos().to(dtype), ang.sin().to(dtype)
+
+
+def _apply_rope(t, cos, sin, is_neox_style: bool):
+    """t: [T, heads, head_dim]. cos/sin: [T, head_dim//2]."""
+    c = cos[:, None, :].to(t.dtype)
+    s = sin[:, None, :].to(t.dtype)
+    if is_neox_style:
+        half = t.shape[-1] // 2
+        t1, t2 = t[..., :half], t[..., half:]
+        return torch.cat([t1 * c - t2 * s, t2 * c + t1 * s], dim=-1)
+    t1, t2 = t[..., 0::2], t[..., 1::2]
+    o1, o2 = t1 * c - t2 * s, t2 * c + t1 * s
+    return torch.stack([o1, o2], dim=-1).flatten(-2)
+
+
+class DFlashAttention(nn.Module):
+    """Query-token attention over a KV cache that already holds the context K/V.
+
+    Mirrors `DFlashQwen3Attention.forward`: qkv split, per-head q_norm/k_norm,
+    RoPE, attention. Here the "cache" is passed in explicitly as (ctx_k, ctx_v).
     """
 
     def __init__(self, cfg: DrafterConfig):
         super().__init__()
-        self.taps = cfg.conv_kernel_size
-        self.groups = cfg.num_groups
-        self.group_size = cfg.conv_group_size
-        self.block_size = cfg.block_size
-        self.base_kernel = nn.Parameter(
-            torch.zeros(2, self.taps, cfg.hidden_size)
-        )
-        with torch.no_grad():
-            self.base_kernel[:, 0].fill_(1.0)
-        self.kernel_projection = nn.Linear(
-            cfg.hidden_size, 2 * self.taps * self.groups, bias=False
-        )
-
-    def forward(self, x, which: int):
-        """which=0 -> pre-sublayer kernel, which=1 -> post-sublayer kernel."""
-        T, H = x.shape
-        delta = self.kernel_projection(x).view(T, 2, self.taps, self.groups)[:, which]
-        base = self.base_kernel[which].view(self.taps, self.groups, self.group_size)
-        blocks = x.view(T, self.groups, self.group_size)
-        out = (base[0] + delta[:, 0].unsqueeze(-1)) * blocks
-        pos = torch.arange(T, device=x.device) % self.block_size
-        for tap in range(1, self.taps):
-            shifted = torch.roll(blocks, shifts=tap, dims=0)
-            valid = (pos >= tap) | (torch.arange(T, device=x.device) >= tap)
-            shifted = shifted * valid[:, None, None].to(shifted.dtype)
-            out = out + (base[tap] + delta[:, tap].unsqueeze(-1)) * shifted
-        return out.view(T, H)
-
-
-def rope(q, k, positions, theta: float, head_dim: int):
-    half = head_dim // 2
-    freqs = theta ** (-torch.arange(0, half, device=q.device, dtype=torch.float32) / half)
-    ang = positions.float()[:, None] * freqs[None, :]
-    cos, sin = ang.cos(), ang.sin()
-
-    def rot(t):
-        t1, t2 = t[..., :half], t[..., half:]
-        c, s = cos[:, None, :].to(t.dtype), sin[:, None, :].to(t.dtype)
-        return torch.cat([t1 * c - t2 * s, t2 * c + t1 * s], dim=-1)
-
-    return rot(q), rot(k)
-
-
-class Attention(nn.Module):
-    def __init__(self, cfg: DrafterConfig):
-        super().__init__()
-        self.nh, self.nkv, self.hd = (
-            cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim)
+        self.num_heads = cfg.num_attention_heads
+        self.num_kv_heads = cfg.num_key_value_heads
+        self.head_dim = cfg.head_dim
+        self.scaling = self.head_dim ** -0.5
         self.theta = cfg.rope_theta
-        self.q_proj = nn.Linear(cfg.hidden_size, self.nh * self.hd, bias=False)
-        self.k_proj = nn.Linear(cfg.hidden_size, self.nkv * self.hd, bias=False)
-        self.v_proj = nn.Linear(cfg.hidden_size, self.nkv * self.hd, bias=False)
-        self.o_proj = nn.Linear(self.nh * self.hd, cfg.hidden_size, bias=False)
-        self.q_norm = RMSNorm(self.hd, cfg.rms_norm_eps)
-        self.k_norm = RMSNorm(self.hd, cfg.rms_norm_eps)
+        self.is_neox_style = cfg.is_neox_style
+        self.sliding_window = cfg.sliding_window
+        self.causal = cfg.causal
+        self.q_proj = nn.Linear(cfg.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, cfg.hidden_size, bias=False)
+        self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
 
-    def forward(self, x, positions, mask):
-        T = x.shape[0]
-        q = self.q_norm(self.q_proj(x).view(T, self.nh, self.hd))
-        k = self.k_norm(self.k_proj(x).view(T, self.nkv, self.hd))
-        v = self.v_proj(x).view(T, self.nkv, self.hd)
-        q, k = rope(q, k, positions, self.theta, self.hd)
-        rep = self.nh // self.nkv
-        k, v = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)
+    def project_context_kv(self, normed_context_states, context_positions):
+        """`_project_context_kv` + `_normalize_context_k` + fused RoPE, for one
+        layer. `normed_context_states` is hidden_norm(context_states), shared by
+        every layer -- the fusion in the source is a pure performance detail."""
+        n = normed_context_states.shape[0]
+        k = self.k_proj(normed_context_states).view(n, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(normed_context_states).view(n, self.num_kv_heads, self.head_dim)
+        k = self.k_norm(k)
+        cos, sin = _rope_cos_sin(
+            context_positions, self.theta, self.head_dim, k.device
+        )
+        k = _apply_rope(k, cos, sin, self.is_neox_style)
+        return k, v
+
+    def forward(self, hidden_states, positions, ctx_k, ctx_v, attn_mask):
+        t = hidden_states.shape[0]
+        q = self.q_proj(hidden_states).view(t, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(t, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(t, self.num_kv_heads, self.head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        cos, sin = _rope_cos_sin(positions, self.theta, self.head_dim, q.device)
+        q = _apply_rope(q, cos, sin, self.is_neox_style)
+        k = _apply_rope(k, cos, sin, self.is_neox_style)
+
+        if ctx_k is not None:
+            k = torch.cat([ctx_k, k], dim=0)
+            v = torch.cat([ctx_v, v], dim=0)
+        rep = self.num_heads // self.num_kv_heads
+        k = k.repeat_interleave(rep, dim=1)
+        v = v.repeat_interleave(rep, dim=1)
+
         o = F.scaled_dot_product_attention(
-            q.transpose(0, 1).unsqueeze(0), k.transpose(0, 1).unsqueeze(0),
-            v.transpose(0, 1).unsqueeze(0), attn_mask=mask)
-        return self.o_proj(o.squeeze(0).transpose(0, 1).reshape(T, -1))
+            q.transpose(0, 1).unsqueeze(0),
+            k.transpose(0, 1).unsqueeze(0),
+            v.transpose(0, 1).unsqueeze(0),
+            attn_mask=attn_mask,
+            scale=self.scaling,
+        )
+        return self.o_proj(o.squeeze(0).transpose(0, 1).reshape(t, -1))
 
 
-class MLP(nn.Module):
+class Qwen3MLP(nn.Module):
     def __init__(self, cfg: DrafterConfig):
         super().__init__()
         self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
@@ -152,70 +276,168 @@ class MLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Layer(nn.Module):
+class DFlash2DecoderLayer(nn.Module):
+    """`DFlash2Qwen3DecoderLayer.forward`, transcribed."""
+
     def __init__(self, cfg: DrafterConfig):
         super().__init__()
-        self.self_attn = Attention(cfg)
-        self.mlp = MLP(cfg)
+        self.self_attn = DFlashAttention(cfg)
+        self.mlp = Qwen3MLP(cfg)
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-        self.attention_conv = DynamicConv(cfg)
-        self.mlp_conv = DynamicConv(cfg)
+        self.attention_conv = DFlashGroupedConv(cfg)
+        self.mlp_conv = DFlashGroupedConv(cfg)
 
-    def forward(self, x, positions, mask):
-        h = self.attention_conv(self.input_layernorm(x), 0)
-        x = x + self.attention_conv(self.self_attn(h, positions, mask), 1)
-        h = self.mlp_conv(self.post_attention_layernorm(x), 0)
-        return x + self.mlp_conv(self.mlp(h), 1)
+    def forward(self, positions, hidden_states, residual, ctx_k, ctx_v, attn_mask):
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
+        hidden_states = self.self_attn(hidden_states, positions, ctx_k, ctx_v, attn_mask)
+        hidden_states = self.attention_conv.finish(hidden_states, coefficients)
+
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, coefficients = self.mlp_conv.prepare(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp_conv.finish(hidden_states, coefficients)
+        return hidden_states, residual
+
+
+# ---------------------------------------------------------------------------
+# qwen3_dflash2.py  ::  _score_edges / CandidateSelector   (verbatim)
+# ---------------------------------------------------------------------------
+
+def _score_edges(
+    predecessor_table: torch.Tensor,
+    successor_table: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    unary_logits: torch.Tensor,
+    hidden: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    successors = successor_table[candidate_ids]
+    predecessor_ids = torch.cat(
+        (
+            anchor_token_ids[:, None, None].expand(-1, 1, top_k),
+            candidate_ids[:, :-1],
+        ),
+        dim=1,
+    )
+    predecessors = predecessor_table[predecessor_ids]
+    return unary_logits[:, :, None] + torch.einsum(
+        "blpr,blcr->blpc", predecessors * hidden[:, :, None], successors
+    )
 
 
 class CandidateSelector(nn.Module):
     def __init__(self, cfg: DrafterConfig):
         super().__init__()
-        r = cfg.selector_rank
-        self.predecessor_codebook = nn.Parameter(torch.randn(cfg.vocab_size, r) * 0.02)
-        self.successor_codebook = nn.Parameter(torch.randn(cfg.vocab_size, r) * 0.02)
-        self.hidden_projection = nn.Linear(cfg.hidden_size, r, bias=False)
+        self.top_k = cfg.selector_top_k
+        self.predecessor_codebook = nn.Parameter(
+            torch.randn(cfg.vocab_size, cfg.selector_rank) * 0.02
+        )
+        self.successor_codebook = nn.Parameter(
+            torch.randn(cfg.vocab_size, cfg.selector_rank) * 0.02
+        )
+        self.hidden_projection = nn.Linear(cfg.hidden_size, cfg.selector_rank, bias=False)
 
-    def pair_scores(self, hidden, cand_prev, cand_next):
-        gate = self.hidden_projection(hidden)
-        a = self.predecessor_codebook[cand_prev]
-        b = self.successor_codebook[cand_next]
-        return torch.einsum("tkr,tlr,tr->tkl", a, b, gate)
+    def forward(self, candidate_ids, unary_logits, hidden_states, anchor_token_ids):
+        hidden = self.hidden_projection(hidden_states)
+        return _score_edges(
+            self.predecessor_codebook,
+            self.successor_codebook,
+            candidate_ids,
+            unary_logits,
+            hidden,
+            anchor_token_ids,
+            self.top_k,
+        )
 
+
+# ---------------------------------------------------------------------------
+# qwen3_dflash.py  ::  DFlashQwen3Model / DFlashQwen3ForCausalLM
+# ---------------------------------------------------------------------------
 
 class DFlash2Drafter(nn.Module):
-    """Trainable set only. embed_tokens and lm_head are the TARGET's, shared and
-    frozen, and are never exported -- which is why the reference is 1.17B."""
+    """Trainable set only. `embed_tokens` and `lm_head` are the TARGET's, shared
+    and frozen, and are never exported -- which is why the reference is 1.17B /
+    81 tensors."""
 
     def __init__(self, cfg: DrafterConfig):
         super().__init__()
         self.cfg = cfg
         self.fc = nn.Linear(
-            len(cfg.target_layer_ids) * cfg.hidden_size, cfg.hidden_size, bias=False)
+            len(cfg.target_layer_ids) * cfg.hidden_size, cfg.hidden_size, bias=False
+        )
         self.hidden_norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
-        self.layers = nn.ModuleList(Layer(cfg) for _ in range(cfg.num_hidden_layers))
+        self.layers = nn.ModuleList(
+            DFlash2DecoderLayer(cfg) for _ in range(cfg.num_hidden_layers)
+        )
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.candidate_selector = CandidateSelector(cfg)
-        # shared, frozen, not part of state_dict
+        # shared, frozen, not exported
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         self.embed_tokens.weight.requires_grad_(False)
         self.lm_head.weight.requires_grad_(False)
 
-    def block_mask(self, T: int, device):
-        B = self.cfg.block_size
-        blk = (torch.arange(T, device=device) // B)
-        return (blk[None, :] <= blk[:, None]).view(1, 1, T, T)
+    # -- context ------------------------------------------------------------
+    def combine_hidden_states(self, aux):
+        """`DFlashQwen3ForCausalLM.combine_hidden_states`: fc over the taps
+        concatenated on the feature axis. aux: [taps, T, H] -> [T, H]."""
+        taps, t, h = aux.shape
+        return self.fc(aux.permute(1, 0, 2).reshape(t, taps * h))
 
-    def forward(self, input_ids, aux, positions):
-        L, T, H = aux.shape
-        x = self.embed_tokens(input_ids) + self.hidden_norm(
-            self.fc(aux.permute(1, 0, 2).reshape(T, L * H)))
-        mask = self.block_mask(T, x.device)
-        for layer in self.layers:
-            x = layer(x, positions, mask)
-        return self.lm_head(self.norm(x))
+    def precompute_context_kv(self, context_states, context_positions):
+        """`precompute_and_store_context_kv`. Returns per-layer (k, v)."""
+        normed = self.hidden_norm(context_states)
+        return [
+            layer.self_attn.project_context_kv(normed, context_positions)
+            for layer in self.layers
+        ]
+
+    # -- query block --------------------------------------------------------
+    def build_query_ids(self, anchor_id, device):
+        d = self.cfg.num_speculative_tokens
+        ids = torch.full((1 + d,), self.cfg.mask_token_id, dtype=torch.long, device=device)
+        ids[0] = anchor_id
+        return ids
+
+    def embed_input_ids(self, input_ids):
+        return self.embed_tokens(input_ids) * self.cfg.input_embedding_scale
+
+    def query_attn_mask(self, query_positions, context_positions):
+        """Queries see the whole context (subject to the sliding window) and,
+        because `config.is_causal` is false, each other bidirectionally."""
+        nq = query_positions.numel()
+        nc = 0 if context_positions is None else context_positions.numel()
+        m = torch.ones(nq, nc + nq, dtype=torch.bool, device=query_positions.device)
+        if nc and self.cfg.sliding_window:
+            dist = query_positions[:, None] - context_positions[None, :]
+            m[:, :nc] = dist < self.cfg.sliding_window
+        if self.cfg.causal:
+            qq = query_positions[:, None] >= query_positions[None, :]
+            m[:, nc:] = qq
+        return m.view(1, 1, nq, nc + nq)
+
+    def forward_block(self, input_ids, positions, ctx_kv, context_positions):
+        """`DFlashQwen3Model.forward` over the 1+D query slots."""
+        hidden_states = self.embed_input_ids(input_ids)
+        attn_mask = self.query_attn_mask(positions, context_positions)
+        residual = None
+        for layer, (ck, cv) in zip(self.layers, ctx_kv):
+            hidden_states, residual = layer(
+                positions, hidden_states, residual, ck, cv, attn_mask
+            )
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
+    def compute_logits(self, hidden_states):
+        return self.lm_head(hidden_states)
 
     def export_state_dict(self) -> dict:
         skip = ("embed_tokens", "lm_head")
