@@ -780,6 +780,32 @@ class Glm5NextModel(nn.Module):
                     aux = layer.hc_post(hidden_states, residual, post, comb)
                 else:
                     aux = hidden_states
+                import os as _os
+                _dump = _os.environ.get("VLLM_DUMP_AUX_DIR")
+                if _dump and not getattr(self, "_dump_gate_dbg", False):
+                    self._dump_gate_dbg = True
+                    print(
+                        f"[AUXDUMP_GATE dump={_dump} dim={aux.dim()} "
+                        f"capturing={torch.cuda.is_current_stream_capturing()} "
+                        f"arm={_os.path.exists(f'{_dump}/ARM')} idx={idx}]",
+                        flush=True,
+                    )
+                if (
+                    _dump
+                    and aux.dim() == 3
+                    and not torch.cuda.is_current_stream_capturing()
+                    and _os.path.exists(f"{_dump}/ARM")
+                ):
+                    _n = getattr(self, "_aux_dump_n", 0)
+                    if _n < 40:
+                        try:
+                            self._aux_dump_n = _n + 1
+                            torch.save(
+                                aux.detach().to(torch.float32).cpu(),
+                                f"{_dump}/streams_L{idx}_{_n:03d}.pt",
+                            )
+                        except Exception:
+                            pass
                 if aux.dim() == 3:
                     aux = aux.mean(dim=1)
                 if self.is_sequence_parallel:

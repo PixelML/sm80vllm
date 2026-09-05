@@ -206,12 +206,20 @@ class DFlashSpeculator(DraftModelSpeculator):
                 gid_to_idx[name_to_gid[name]] for name in layer_names
             ]
             if hasattr(self.model, "get_draft_attn_causal"):
-                self._group_causal = {
-                    name_to_gid[name]: layer_causal
-                    for name, layer_causal in zip(
-                        layer_names, self.model.get_draft_attn_causal()
-                    )
-                }
+                causal_list = list(self.model.get_draft_attn_causal())
+                if causal_list and all(c == causal_list[0] for c in causal_list):
+                    # Uniform causality: pass a scalar. The per-group dict is
+                    # keyed by global kv-cache-group ids, but the draft-side
+                    # build enumerates its own group indices and falls back to
+                    # causal=True on a miss (attn_utils.build_attn_metadata:
+                    # causal.get(i, True)) -- which silently ran the DFlash2
+                    # drafter CAUSAL and collapsed deep-position acceptance.
+                    self._group_causal = causal_list[0]
+                else:
+                    self._group_causal = {
+                        name_to_gid[name]: layer_causal
+                        for name, layer_causal in zip(layer_names, causal_list)
+                    }
 
     @torch.inference_mode()
     def _run_model(
@@ -421,6 +429,15 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         import os as _os
         if _os.environ.get("VLLM_DFLASH_DEBUG") == "1" and not dummy_run:
+            if not hasattr(self, "_dbg_meta_once"):
+                self._dbg_meta_once = True
+                for lname, meta in (attn_metadata or {}).items():
+                    print(
+                        f"[DFLASH_META layer={lname.split(chr(46))[-3:]} "
+                        f"causal={getattr(meta, chr(99)+chr(97)+chr(117)+chr(115)+chr(97)+chr(108), chr(63))} "
+                        f"type={type(meta).__name__}]",
+                        flush=True,
+                    )
             if not hasattr(self, "_dbg_n"):
                 self._dbg_n = 0
             if self._dbg_n < 8:
@@ -465,6 +482,18 @@ class DFlashSpeculator(DraftModelSpeculator):
             step=self.num_query_per_req,
             causal=self._group_causal,
         )
+        import os as _os3
+        if _os3.environ.get("VLLM_DFLASH_DEBUG") == "1" and not dummy_run:
+            if not hasattr(self, "_dbg_dm_once"):
+                self._dbg_dm_once = True
+                print(f"[DFLASH_GROUPCAUSAL {self._group_causal!r}]", flush=True)
+                for _ln, _m in (draft_attn_metadata or {}).items():
+                    if "FlashAttention" in type(_m).__name__:
+                        print(
+                            f"[DFLASH_DRAFTMETA {_ln.split(chr(46))[-3]} "
+                            f"causal={_m.causal} type={type(_m).__name__}]",
+                            flush=True,
+                        )
         draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
             self.block_tables.slot_mappings[:, :num_tokens_padded],
             self.kv_cache_config,
