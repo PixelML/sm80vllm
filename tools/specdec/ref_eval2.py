@@ -51,6 +51,36 @@ def load_drafter(weights, shared, cfg, device, dtype):
     return model
 
 
+def build_eval_block(model, cfg, ids, ctx_kv_full, a, max_ctx, depth, device,
+                     convention="runtime"):
+    """One query block at anchor `a`.
+
+    The trainer's `build_batch` is the batched form of exactly this; they are
+    held equal by `test_overfit.py`, so training cannot optimise a shape the
+    evaluator does not measure. (Run 2 produced a curve on a convention the
+    trainer had already moved off; this is the guard for that.)
+    """
+    ctx_end = a + 1 if convention == "memo" else a
+    q0 = a + 1 if convention == "memo" else a
+    c0 = max(0, ctx_end - max_ctx)
+    ctx_pos = torch.arange(c0, ctx_end, device=device)
+    ctx_kv = [(k[c0:ctx_end], v[c0:ctx_end]) for k, v in ctx_kv_full]
+    q_ids = model.build_query_ids(int(ids[a]), device)
+    q_pos = torch.arange(q0, q0 + 1 + depth, device=device)
+
+    n_ctx = ctx_pos.numel()
+    dist = q_pos[:, None] - ctx_pos[None, :]
+    ok = dist > 0
+    if cfg.sliding_window:
+        ok = ok & (dist < cfg.sliding_window)
+    qq = torch.ones(1 + depth, 1 + depth, dtype=torch.bool, device=device)
+    if cfg.causal:
+        qq = q_pos[:, None] >= q_pos[None, :]
+    attn_mask = torch.cat([ok, qq], dim=-1)[None, None]
+    targets = ids[a + 1: a + 1 + depth]
+    return q_ids, q_pos, ctx_kv, attn_mask, targets
+
+
 @torch.no_grad()
 def score(model, cfg, data, depth, max_ctx, max_blocks, stride, convention, device):
     drafts, targets, blocks = [], [], 0
@@ -68,20 +98,13 @@ def score(model, cfg, data, depth, max_ctx, max_blocks, stride, convention, devi
         ]
         lo = max(8, max_ctx // 8)
         for a in range(lo, seq_len - depth, stride):
-            if convention == "memo":
-                ctx_end, anchor_id, q0 = a + 1, ids[a], a + 1
-                tgt = ids[a + 1: a + 1 + depth]
-            else:
-                ctx_end, anchor_id, q0 = a, ids[a], a
-                tgt = ids[a + 1: a + 1 + depth]
+            tgt = ids[a + 1: a + 1 + depth]
             if tgt.shape[0] < depth:
                 break
-            c0 = max(0, ctx_end - max_ctx)
-            ctx_pos = all_pos[c0:ctx_end]
-            ctx_kv = [(k[c0:ctx_end], v[c0:ctx_end]) for k, v in ctx_kv_full]
-            q_ids = model.build_query_ids(int(anchor_id), device)
-            q_pos = torch.arange(q0, q0 + 1 + depth, device=device)
-            h = model.forward_block(q_ids, q_pos, ctx_kv, ctx_pos)
+            q_ids, q_pos, ctx_kv, attn_mask, _ = build_eval_block(
+                model, cfg, ids, ctx_kv_full, a, max_ctx, depth, device, convention)
+            h = model.forward_blocks(q_ids[None], q_pos[None], ctx_kv, attn_mask,
+                                     n_blocks=1)
             logits = model.compute_logits(h[1:])          # mask slots only
             drafts.append(logits.float().argmax(-1).cpu().numpy())
             targets.append(tgt.cpu().numpy())
