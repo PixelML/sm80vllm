@@ -1212,7 +1212,11 @@ def unified_mla_kv_cache_update(
             kv_c_normed,
             k_pe,
             layer_slot_mapping,
-            attn_metadata.num_decode_tokens if attn_metadata is not None else None,
+            # XPUMLASparseMetadata (Triton sparse-MLA fallback) carries no
+            # num_decode_tokens; it is only consumed by the PCP gather path.
+            getattr(attn_metadata, "num_decode_tokens", None)
+            if attn_metadata is not None
+            else None,
             attn_layer.use_pcp,
         )
         attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]

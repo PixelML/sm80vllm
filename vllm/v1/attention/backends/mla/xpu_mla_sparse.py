@@ -97,6 +97,17 @@ class XPUMLASparseMetadata(AttentionMetadata):
     block_size: int = 1
     topk_tokens: int = 2048
 
+    # This backend routes EVERY token (prefill and decode alike) through the
+    # top-k MQA path — there is no dense-MHA prefill pipeline — so the whole
+    # batch is presented as "decode" to the shared MLA wrapper: num_decodes
+    # covers all requests and num_decode_tokens all tokens. The wrapper then
+    # computes num_mha_tokens == 0 and never touches the prefill-only fields
+    # it would otherwise read (prefill_max_seq_len, .prefill, ...).
+    num_decodes: int = 0
+    num_prefills: int = 0
+    num_decode_tokens: int = 0
+    num_prefill_tokens: int = 0
+
 
 @dataclass
 class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]):
@@ -166,6 +177,10 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
+            num_decodes=common_attn_metadata.num_reqs,
+            num_prefills=0,
+            num_decode_tokens=common_attn_metadata.num_actual_tokens,
+            num_prefill_tokens=0,
         )
         return metadata
 
@@ -254,7 +269,11 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
             attn_metadata.block_table,
             topk_indices,
             BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+            # Use the buffer's actual width, not config.index_topk: kpool
+            # models (GLM-5.3-Flash) widen the buffer by the always-selected
+            # tail (+ rounding to a BLOCK_N=128 multiple). Extra slots are -1
+            # and masked out by the sparse attention kernel.
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
         )
 
         attn_out = self._forward_bf16_kv(
