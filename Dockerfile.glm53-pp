@@ -1,0 +1,37 @@
+# ghcr.io/pixelml/club-170hx:vllm-glm53-sm80-pp-20260905
+#
+# GLM-5.3-Flash PP on SM80 (CMP 170HX), built as a Python overlay on the official
+# GLM release image. No CUDA compilation: the 24 ported patches are pure Python
+# against the installed vllm package, so the base image's prebuilt kernels are used
+# unchanged.
+#
+# Attribution
+#   Base image : vllm/vllm-openai:glm53-flash
+#                sha256:2c6da6c6f16ed15c91e412d896dba13701f25fe1861eaec9ddaa4db34d1d21c4
+#                vLLM 0.1.dev20051+g487ecf187, Apache-2.0
+#   Patches    : https://github.com/promisezackr/glm53-flash-170hx-pp8 @ 90ec72e
+#                Apache-2.0, all 24 taken as-is (see git log for per-patch trailers)
+#   PP4 recipe : adapted by Pixel ML from his scripts/run_prod.sh (8 cards -> 4)
+#
+# Not baked in: model weights, and the DFlash2 drafter (incoai/GLM-5.3-Flash-DFlash2,
+# cc-by-nc-nd-4.0, research use only) - both are bind-mounted at run time.
+FROM vllm/vllm-openai:glm53-flash
+
+# The 66 patched files (48 modified + 18 new) overlay the installed package.
+COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
+
+# Host-side tooling: his forensics/bench scripts and our specdec extraction tools.
+COPY tools/       /opt/pixelml/tools/
+COPY scripts/     /opt/pixelml/scripts/
+COPY recipes/     /opt/pixelml/recipes/
+COPY preflight.py /opt/pixelml/preflight.py
+
+# Fail the build if the overlay did not land or the package no longer imports.
+COPY docker/verify_overlay.py /opt/pixelml/verify_overlay.py
+RUN python3 /opt/pixelml/verify_overlay.py
+
+LABEL org.opencontainers.image.source="https://github.com/PixelML/vllm-sm80" \
+      org.opencontainers.image.description="GLM-5.3-Flash PP4/PP8 on SM80 (CMP 170HX): vllm-openai:glm53-flash + promisezackr 24-patch series" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      com.pixelml.base-image="vllm/vllm-openai:glm53-flash@sha256:2c6da6c6f16ed15c91e412d896dba13701f25fe1861eaec9ddaa4db34d1d21c4" \
+      com.pixelml.patch-source="https://github.com/promisezackr/glm53-flash-170hx-pp8@90ec72e"
