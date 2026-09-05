@@ -676,6 +676,11 @@ class Glm5NextModel(nn.Module):
         # hop carries the materialized residual streams [T, n, H] (the
         # sending stage folds its deferred hc_post in before the send — see
         # forward); without mHC it is the plain [T, H] hidden states.
+        # DFlash/EAGLE3 aux hidden-state taps: vllm layer-id semantics, id k
+        # means "after decoder layer k-1" (HF hidden_states[k]). Empty tuple =
+        # disabled; the runner sets this via set_aux_hidden_state_layers().
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+
         if getattr(config, "mhc", False):
             n_streams = config.mhc_num_residual_streams
             hidden_size = config.hidden_size
@@ -683,15 +688,21 @@ class Glm5NextModel(nn.Module):
             def _make_empty_intermediate_tensors(
                 batch_size: int, dtype: torch.dtype, device: torch.device
             ) -> IntermediateTensors:
-                return IntermediateTensors(
-                    {
-                        "hidden_states": torch.zeros(
-                            (batch_size, n_streams, hidden_size),
-                            dtype=dtype,
-                            device=device,
-                        )
-                    }
-                )
+                tensors = {
+                    "hidden_states": torch.zeros(
+                        (batch_size, n_streams, hidden_size),
+                        dtype=dtype,
+                        device=device,
+                    )
+                }
+                # Aux taps are spread across PP stages; ship every slot on
+                # every hop (fixed key set so the send/recv dicts always
+                # match), earlier stages leave later slots zeroed.
+                for k in range(len(self.aux_hidden_state_layers)):
+                    tensors[f"aux_hidden_{k}"] = torch.zeros(
+                        (batch_size, hidden_size), dtype=dtype, device=device
+                    )
+                return IntermediateTensors(tensors)
 
             self.make_empty_intermediate_tensors = _make_empty_intermediate_tensors
         else:
@@ -737,10 +748,31 @@ class Glm5NextModel(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
-        for layer in self._active_layers:
+        # DFlash/EAGLE3 aux taps: slot k holds the materialized single-stream
+        # hidden state after layer aux_ids[k]-1 (HF hidden_states semantics;
+        # streams contracted by mean over the mHC dim, matching DeepSeek-V4's
+        # DSpark collection and the DFlash2 drafter's fc input width). Slots
+        # for taps on earlier stages arrive via IntermediateTensors.
+        aux_ids = self.aux_hidden_state_layers
+        aux_slots: list[torch.Tensor | None] = [None] * len(aux_ids)
+        if aux_ids and intermediate_tensors is not None:
+            for k in range(len(aux_ids)):
+                aux_slots[k] = intermediate_tensors[f"aux_hidden_{k}"]
+
+        for idx, layer in enumerate(self._active_layers, start=self.start_layer):
             hidden_states, residual, post, comb = layer(
                 positions, hidden_states, residual, post, comb
             )
+            if aux_ids and (idx + 1) in aux_ids:
+                if post is not None:
+                    aux = layer.hc_post(hidden_states, residual, post, comb)
+                else:
+                    aux = hidden_states
+                if aux.dim() == 3:
+                    aux = aux.mean(dim=1)
+                if self.is_sequence_parallel:
+                    aux = sp_all_gather(aux)[:full_num_tokens]
+                aux_slots[aux_ids.index(idx + 1)] = aux
 
         if not get_pp_group().is_last_rank:
             if post is not None:
@@ -753,12 +785,24 @@ class Glm5NextModel(nn.Module):
                 hidden_states = last_layer.hc_post(
                     hidden_states, residual, post, comb
                 )
-            return IntermediateTensors({"hidden_states": hidden_states})
+            out = {"hidden_states": hidden_states}
+            for k, aux in enumerate(aux_slots):
+                out[f"aux_hidden_{k}"] = (
+                    aux
+                    if aux is not None
+                    else hidden_states.new_zeros(
+                        (hidden_states.shape[0], hidden_states.shape[-1])
+                    )
+                )
+            return IntermediateTensors(out)
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         hidden_states = self.norm(hidden_states)
+        if aux_ids:
+            assert all(a is not None for a in aux_slots)
+            return hidden_states, list(aux_slots)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -956,6 +1000,20 @@ class Glm5NextForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    # DFlash/EAGLE3 aux hidden-state interface (SupportsEagle3 protocol).
+    # The runtime_checkable isinstance also requires the SupportsEagleBase
+    # data members to exist on the instance (protocol defaults don't count).
+    supports_eagle3: ClassVar[Literal[True]] = True
+    has_own_lm_head: bool = False
+    has_own_embed_tokens: bool = False
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = tuple(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = self.config.num_hidden_layers
+        return (2, num_layers // 2, num_layers - 3)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1060,6 +1118,17 @@ class Glm5NextForConditionalGeneration(
         from .model import Glm5NextForCausalLM
 
         return Glm5NextForCausalLM.get_mamba_state_copy_func()
+
+    # DFlash/EAGLE3 aux hidden-state interface: delegate to the text tower.
+    supports_eagle3: ClassVar[Literal[True]] = True
+    has_own_lm_head: bool = False
+    has_own_embed_tokens: bool = False
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.language_model.get_eagle3_default_aux_hidden_state_layers()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Glm4vForConditionalGeneration, self).__init__()

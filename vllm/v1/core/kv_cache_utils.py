@@ -984,8 +984,15 @@ def _pool_bytes_per_block(
         # tensors, and tail layers co-own the indexer slot tensors, so a block
         # costs one MLA page per MLA slot plus one indexer page per indexer
         # slot (the tail rides inside the indexer page via slot-sharing).
-        _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5
-        return len(mla_names) * mla_page + len(idx_names) * idx_page
+        _, _, mla_names, idx_names, mla_page, idx_page, _, _, sidecar = glm5
+        sidecar_per_block = sum(
+            g.kv_cache_spec.page_size_bytes * len(g.layer_names) for g in sidecar
+        )
+        return (
+            len(mla_names) * mla_page
+            + len(idx_names) * idx_page
+            + sidecar_per_block
+        )
     if _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         # buckets = {page_size: [[layer_names], [layer_names], ...]}
         buckets = _bucket_layers_by_page_size(kv_cache_groups)
@@ -1111,12 +1118,18 @@ def unify_kv_cache_spec_page_size(
             ):
                 new_spec = replace(layer_spec, page_size_padded=max_page_size)
             else:
+                page_map = {
+                    n: (sp.page_size_bytes, sp.block_size,
+                        type(sp).__name__)
+                    for n, sp in kv_cache_spec.items()
+                }
                 raise NotImplementedError(
-                    f"Layer {layer_name}: page size is not divisible by the "
-                    "maximum page size and cannot be padded. Padding is only "
-                    "supported for attention layers whose backend indexes KV "
-                    "pages by the block stride (indexes_kv_by_block_stride is "
-                    "True)."
+                    f"Layer {layer_name}: page size {layer_page_size} is not "
+                    f"divisible by the maximum page size {max_page_size} and "
+                    "cannot be padded. Padding is only supported for attention "
+                    "layers whose backend indexes KV pages by the block stride "
+                    "(indexes_kv_by_block_stride is True). All layer pages "
+                    f"(page_bytes, block, spec): {page_map}"
                 )
             assert new_spec.page_size_bytes == max_page_size
             new_kv_cache_spec[layer_name] = new_spec
@@ -1416,6 +1429,18 @@ def _get_kv_cache_groups_glm5_next(
         for k, v in kv_cache_spec.items()
         if not isinstance(v, (MambaSpec, KpoolTailSpec))
     }
+    # Sidecar: layers outside the GLM-5-Next family (e.g. a DFlash draft
+    # model's sliding/full attention). They get their own per-layer tensors
+    # and group(s); the core slot-sharing layout below stays untouched. This
+    # keeps the incompatible page geometries (indexer 33 B/token vs the
+    # draft's power-of-two pages) out of the same-page unification entirely.
+    sidecar_specs = {
+        k: v for k, v in attn_specs.items() if type(v) is not MLAAttentionSpec
+    }
+    if sidecar_specs:
+        attn_specs = {
+            k: v for k, v in attn_specs.items() if k not in sidecar_specs
+        }
     if not mamba_specs or not all(
         type(s) is MLAAttentionSpec for s in attn_specs.values()
     ):
@@ -1475,10 +1500,18 @@ def _get_kv_cache_groups_glm5_next(
     mamba_grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
     for k, name in enumerate(mamba_specs):
         mamba_grouped_names[k % num_groups].append(name)
+    sidecar_groups: list[KVCacheGroupSpec] = []
+    if sidecar_specs:
+        by_spec: dict[KVCacheSpec, list[str]] = {}
+        for name, spec in sidecar_specs.items():
+            by_spec.setdefault(spec, []).append(name)
+        for spec, names in by_spec.items():
+            sidecar_groups.append(KVCacheGroupSpec(names, spec))
     return (
         [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
         + ([tail_group] if tail_group is not None else [])
         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
+        + sidecar_groups
     )
 
 
@@ -1494,6 +1527,7 @@ def _glm5_next_tensor_layout(
         int,
         list[str],
         int,
+        list[KVCacheGroupSpec],
     ]
     | None
 ):
@@ -1526,7 +1560,18 @@ def _glm5_next_tensor_layout(
             tail_group = g
     if attn_group is None or not mamba_groups:
         return None
-    if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
+    # Sidecar groups (e.g. DFlash draft attention): everything that is neither
+    # part of the core slot-sharing layout nor a mamba group. They own plain
+    # per-layer tensors sized by their own page.
+    core_ids = {id(attn_group)} | ({id(tail_group)} if tail_group else set())
+    core_ids |= {id(g) for g in mamba_groups}
+    sidecar_groups = [g for g in kv_cache_groups if id(g) not in core_ids]
+    if any(
+        isinstance(g.kv_cache_spec, (UniformTypeKVCacheSpecs, MambaSpec))
+        for g in sidecar_groups
+    ):
+        # An unclassified uniform/mamba group means this is not the glm5-next
+        # layout after all.
         return None
     attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
     if not all(
@@ -1569,6 +1614,7 @@ def _glm5_next_tensor_layout(
         idx_pages.pop(),
         tail_names,
         tail_page,
+        sidecar_groups,
     )
 
 
@@ -1633,6 +1679,7 @@ def get_kv_cache_config_from_groups(
             idx_page,
             tail_names,
             _tail_page,
+            sidecar_groups,
         ) = glm5n
         # The logical tail page (2048 B) is unused for sizing: the tail rides
         # inside idx_page via slot-sharing. It is retained in the layout tuple
@@ -1641,7 +1688,15 @@ def get_kv_cache_config_from_groups(
             assert len(idx_names) == len(tail_names), (
                 "indexer/tail layer count mismatch: cannot pair for slot-sharing"
             )
-        per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
+        sidecar_per_block = sum(
+            g.kv_cache_spec.page_size_bytes * len(g.layer_names)
+            for g in sidecar_groups
+        )
+        per_block = (
+            len(mla_names) * mla_page
+            + len(idx_names) * idx_page
+            + sidecar_per_block
+        )
         num_blocks = available_memory // per_block
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
         kv_cache_tensors = [
@@ -1663,6 +1718,15 @@ def get_kv_cache_config_from_groups(
                 ),
             )
             for i in range(len(idx_names))
+        ] + [
+            # Sidecar layers (e.g. DFlash draft attention): plain per-layer
+            # tensors at their own page size, no slot sharing.
+            KVCacheTensor(
+                size=g.kv_cache_spec.page_size_bytes * num_blocks,
+                shared_by=[layer_name],
+            )
+            for g in sidecar_groups
+            for layer_name in g.layer_names
         ]
     elif _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
         # DeepSeek V4 uses the packed layout by default. Other multi-group
@@ -2211,6 +2275,7 @@ def _max_memory_usage_bytes_from_groups(
             idx_page,
             tail_names,
             _tail_page,
+            sidecar_groups,
         ) = glm5n
         uniform_spec = attn_group.kv_cache_spec
         assert isinstance(uniform_spec, UniformTypeKVCacheSpecs)
@@ -2224,7 +2289,35 @@ def _max_memory_usage_bytes_from_groups(
             # Tail: 1 block/req (KpoolTailSpec.max_admission_blocks_per_request
             # == 1), drawn from the shared pool.
             blocks_needed += 1
-        return blocks_needed * (len(mla_names) * mla_page + len(idx_names) * idx_page)
+        for group in sidecar_groups:
+            # PP projection can leave a sidecar group empty on ranks that
+            # hold none of its layers; an empty group allocates no tensors
+            # and must not add block demand.
+            if not group.layer_names:
+                continue
+            spec = group.kv_cache_spec
+            blocks_needed += cdiv(
+                spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
+            )
+        sidecar_per_block = sum(
+            g.kv_cache_spec.page_size_bytes * len(g.layer_names)
+            for g in sidecar_groups
+        )
+        logger.info(
+            "glm5n max-mem accounting: blocks_needed=%d (core=%d) per_block="
+            "mla %d*%d + idx %d*%d + sidecar %d; sidecar blocks=%s",
+            blocks_needed,
+            uniform_spec.max_memory_usage_pages(vllm_config),
+            len(mla_names), mla_page, len(idx_names), idx_page,
+            sidecar_per_block,
+            [(g.layer_names[:1], g.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+              g.kv_cache_spec.page_size_bytes) for g in sidecar_groups],
+        )
+        return blocks_needed * (
+            len(mla_names) * mla_page
+            + len(idx_names) * idx_page
+            + sidecar_per_block
+        )
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len

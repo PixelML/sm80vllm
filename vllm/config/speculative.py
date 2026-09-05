@@ -1173,7 +1173,7 @@ class SpeculativeConfig:
                         self.target_parallel_config, self.draft_tensor_parallel_size
                     )
                 )
-                if self.method in ("dspark", "mtp"):
+                if self.method in ("dspark", "mtp", "dflash"):
                     # The DSpark/MTP draft is NOT pipelined: the model runner
                     # builds it on the last PP rank only and it runs there
                     # whole, so it is a pp_size=1 model regardless of the target's split.
