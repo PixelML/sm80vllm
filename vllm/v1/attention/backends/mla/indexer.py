@@ -525,6 +525,14 @@ class DeepseekV32IndexerMetadata:
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
 
+    # Fused-draft-loop refresh inputs, captured at build time. Stored ON the
+    # metadata (not the builder): under async scheduling the next step's
+    # TARGET build can overlap the current draft loop, so builder-instance
+    # state may be overwritten with the wrong batch's tensors mid-drafting
+    # (observed as an illegal memory access under concurrency).
+    draft_update_common: "CommonAttentionMetadata | None" = None
+    draft_update_indexer_block_table: torch.Tensor | None = None
+
 
 def compute_kpool_tail_slot_mapping(
     slot_mapping: torch.Tensor,
@@ -597,10 +605,6 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         # compressed_slot_mapping) -- the tail is storage-only and exports only
         # slot_mapping, which is rebuilt per step from the group's block table.
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        # Inputs of the last build(), for the fused-draft-loop refresh: the
-        # common metadata's tensors are views over runner buffers that the
-        # fused loop advances in place between draft steps.
-        self._last_common_metadata: CommonAttentionMetadata | None = None
 
     def build(
         self,
@@ -611,7 +615,6 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(common_attn_metadata)
         )
-        self._last_common_metadata = common_attn_metadata
         slot_mapping = common_attn_metadata.slot_mapping
         positions = common_attn_metadata.positions
         if positions is not None:
@@ -636,6 +639,7 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
             num_prefill_tokens=num_prefill_tokens,
             prefill=None,
             decode=None,
+            draft_update_common=common_attn_metadata,
         )
 
     def update_draft_decode_metadata(
@@ -644,7 +648,7 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         # Between fused draft steps only the circular tail slots move (they
         # depend on the per-token positions, which the fused loop advanced in
         # place); seq_lens is already a view over the advanced runner buffer.
-        common = self._last_common_metadata
+        common = metadata.draft_update_common
         if common is None or metadata.num_decode_tokens == 0:
             return
         if common.positions is None:
@@ -726,8 +730,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.supports_draft_decode_metadata_update = (
             self.dcp_world_size == 1 and not self.use_pcp
         )
-        self._last_common_metadata: CommonAttentionMetadata | None = None
-        self._last_indexer_block_table: torch.Tensor | None = None
         # The DCP sparse-indexer code is parameterized by interleave size, but
         # interleave > 1 is not yet validated end-to-end (gsm8k parity fails),
         # so fail closed here rather than silently produce wrong output.
@@ -1133,9 +1135,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
             compressed_seq_lens = seq_lens // self.compress_ratio
 
-        self._last_common_metadata = common_attn_metadata
-        self._last_indexer_block_table = indexer_block_table
-
         prefill_metadata = None
         if num_prefills > 0:
             # This CPU value is an upper bound for async-spec extend rows.  It
@@ -1369,6 +1368,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             num_prefill_tokens=num_prefill_tokens,
             prefill=prefill_metadata,
             decode=decode_metadata,
+            draft_update_common=common_attn_metadata,
+            draft_update_indexer_block_table=indexer_block_table,
         )
 
         return attn_metadata
@@ -1390,7 +1391,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         Expanded block tables and decode_lens are step-invariant.
         """
         decode = metadata.decode
-        common = self._last_common_metadata
+        common = metadata.draft_update_common
         if decode is None or common is None or metadata.num_decode_tokens == 0:
             return
         num_tokens = metadata.num_decode_tokens
@@ -1410,12 +1411,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.compress_ratio,
                 out=self.expanded_seq_lens_buffer[:num_tokens],
             )
-            assert self._last_indexer_block_table is not None
+            assert metadata.draft_update_indexer_block_table is not None
             get_compressed_slot_mapping(
                 num_tokens,
                 common.query_start_loc,
                 common.seq_lens,
-                self._last_indexer_block_table,
+                metadata.draft_update_indexer_block_table,
                 self.kv_cache_spec.storage_block_size,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,

@@ -96,6 +96,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self._configure_fused_multi_step_decode()
 
     def _configure_fused_multi_step_decode(self) -> None:
+        import os
+        if os.environ.get("VLLM_ENABLE_FUSED_DRAFT") != "1":
+            # Default OFF: the SM80 indexer/tail update hooks are not yet
+            # capture-safe and crash (illegal memory access) under concurrent
+            # spec decode; with the sync-free draft scatter restoring CPU/GPU
+            # overlap, per-step rebuilds are off the critical path anyway
+            # (51-61 tok/s fused-off vs 53-64 fused-on, within noise).
+            self.use_fused_multi_step_decode = False
+            return
         if self.num_speculative_steps == 1:
             self.use_fused_multi_step_decode = False
             return
