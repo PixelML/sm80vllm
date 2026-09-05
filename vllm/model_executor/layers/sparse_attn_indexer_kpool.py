@@ -838,19 +838,18 @@ def sparse_attn_indexer_kpool(
                 clean_logits=False,
             )
         else:
-            # SM8x/SM12x Triton fallback. The Triton kernel takes 1-D [B]
-            # context lens (per-token positions are derived in-kernel as
-            # ctx - next_n + i, matching DeepGEMM's consecutive-token
-            # convention) and the 4-D [NB, bs, 1, D+4] cache view.
+            # SM8x/SM12x Triton fallback. Pass the exact 2D (B, next_n)
+            # context lens through unchanged: after the builder's
+            # `seq_lens //= compress_ratio`, per-token pool bounds are NOT
+            # consecutive, so collapsing to [:, -1] and reconstructing
+            # `ctx - next_n + i` in-kernel hid up to next_n-1 most-recent
+            # pools from earlier verify rows (MTP acceptance collapse).
             assert padded_q_scale is None
-            seq_lens_1d = (
-                seq_lens if seq_lens.ndim == 1 else seq_lens[:, -1].contiguous()
-            )
             logits = fp8_paged_mqa_logits_triton(
                 padded_q_quant_cast,
                 kv_cache.unsqueeze(2) if kv_cache.ndim == 3 else kv_cache,
                 padded_weights[:num_padded_tokens],
-                seq_lens_1d,
+                seq_lens,
                 decode_metadata.block_table,
                 max_model_len=max_model_len,
                 clean_logits=False,

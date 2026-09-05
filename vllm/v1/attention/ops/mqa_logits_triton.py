@@ -76,6 +76,7 @@ def _fp8_paged_mqa_logits_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
+    PER_ROW_CTX: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -86,11 +87,23 @@ def _fp8_paged_mqa_logits_kernel(
     batch_id = token_id // next_n
     next_n_id = token_id % next_n
 
-    context_len = tl.load(context_lens_ptr + batch_id)
+    # PER_ROW_CTX: context_lens is [B*next_n] with each row's EXACT visible
+    # KV count (deep_gemm 2D context_lens semantics). Required whenever the
+    # metadata builder compresses seq_lens by a pool ratio: the compressed
+    # per-token bounds `(L - next_n + j + 1) // kpool` are no longer
+    # consecutive integers, so reconstructing them from the last row's value
+    # (`ctx - next_n + j`) subtracts token-granular offsets in pool space and
+    # hides up to `next_n - 1` most-recent pools from earlier verify rows --
+    # which is what collapsed MTP acceptance. The 1D [B] form keeps the
+    # reconstruction for uncompressed callers (warmup, legacy).
+    if PER_ROW_CTX:
+        context_len = tl.load(context_lens_ptr + token_id)
+        q_offset = context_len - 1
+    else:
+        context_len = tl.load(context_lens_ptr + batch_id)
+        q_offset = context_len - next_n + next_n_id
     if block_rk * block_size >= context_len:
         return
-
-    q_offset = context_len - next_n + next_n_id
 
     # int64: unified-KV-pool layer views carry a large block stride (~1e6
     # elements), so int32 `block_idx * stride` wraps once a batch touches
@@ -165,7 +178,11 @@ def fp8_paged_mqa_logits_triton(
         q:             [B, next_n, H, D] fp8_e4m3fn
         kv_cache:      [num_blocks, block_size, 1, D+4] uint8 (FP8 + fp32 scale)
         weights:       [B*next_n, H] float32
-        context_lens:  [B] int32
+        context_lens:  [B, next_n] int32 exact per-row visible-KV counts
+            (deep_gemm 2D semantics; row (b, j) attends [0, ctx[b, j])) --
+            REQUIRED under seq-len compression (kpool), where per-token bounds
+            are not consecutive. Or legacy 1D [B] int32 (uncompressed only):
+            per-row bounds are reconstructed in-kernel as ctx - next_n + j + 1.
         block_tables:  [B, max_blocks] int32
         max_model_len: output width. Caller passes the active batch max so
             the logits buffer and grid stay tight.
@@ -178,6 +195,18 @@ def fp8_paged_mqa_logits_triton(
     _, block_size, one, d_plus_4 = kv_cache.shape
     assert one == 1
     assert d_plus_4 == head_dim + 4
+
+    if context_lens.ndim == 2:
+        # (B, next_n) or (B, 1) exact per-row bounds; both layouts are
+        # contiguous buffer views at the call sites, so reshape stays a view
+        # (no allocation under cudagraph capture).
+        assert context_lens.shape[0] == B and context_lens.shape[1] in (1, next_n)
+        per_row_ctx = context_lens.shape[1] == next_n
+        ctx_arg = context_lens.reshape(-1) if per_row_ctx else context_lens[:, 0]
+    else:
+        assert context_lens.ndim == 1 and context_lens.shape[0] == B
+        per_row_ctx = False
+        ctx_arg = context_lens
 
     # Cache layout from `indexer_k_quant_and_cache`: per block, FP8 K bytes
     # (block_size * head_dim) followed by fp32 scales (block_size * 4). The
@@ -222,7 +251,7 @@ def fp8_paged_mqa_logits_triton(
         kv_scale,
         weights,
         fp8_lut,
-        context_lens,
+        ctx_arg,
         block_tables,
         logits,
         q_byte.stride(0),
@@ -244,6 +273,7 @@ def fp8_paged_mqa_logits_triton(
         num_heads=num_heads,
         head_dim=head_dim,
         block_size=block_size,
+        PER_ROW_CTX=per_row_ctx,
         BLOCK_H=BLOCK_H,
         BLOCK_D=BLOCK_D,
         BLOCK_N=BLOCK_N,

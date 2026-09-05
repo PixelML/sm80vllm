@@ -22,6 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -33,6 +34,8 @@ from .model import (
     get_spec_layer_idx_from_weight_name,
 )
 from .ops.fused_eh_norm import fused_eh_norm
+
+logger = init_logger(__name__)
 
 
 class Glm5NextMultiTokenPredictorLayer(nn.Module):
@@ -333,6 +336,30 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            # Under PP>1 the runner's _maybe_share_embeddings/_maybe_share_lm_head
+            # skip target-weight sharing ("loaded separately"), while this loader
+            # used to drop both names as non-spec-layer weights — leaving the
+            # draft's embed_tokens and shared_head.head random-init (drafts were
+            # noise, 0% acceptance). Load them from the checkpoint directly; the
+            # runner's sharing (pp=1) later just rebinds over the same values.
+            if name == "model.embed_tokens.weight":
+                direct_target = "model.embed_tokens.weight"
+            elif name == "lm_head.weight":
+                direct_target = (
+                    f"model.layers.{self.model.mtp_start_layer_idx}"
+                    ".shared_head.head.weight"
+                )
+            else:
+                direct_target = None
+            if direct_target is not None:
+                if direct_target in params_dict:
+                    param = params_dict[direct_target]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(direct_target)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
@@ -437,4 +464,15 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     f"MTP speculative decoding layer {layer_idx} weights "
                     f"missing from checkpoint."
                 )
+        # The per-layer check above passes as soon as ANY weight of a layer
+        # loads, so silently-swallowed params (fp8 helpers returning consumed
+        # without a store) slip through as random init. Log the exact gap.
+        untouched = sorted(set(params_dict) - loaded_params)
+        logger.warning(
+            "MTP draft load: %d/%d params loaded; untouched=%d%s",
+            len(loaded_params & set(params_dict)),
+            len(params_dict),
+            len(untouched),
+            (" first: " + ", ".join(untouched[:25])) if untouched else "",
+        )
         return loaded_params
