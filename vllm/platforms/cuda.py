@@ -130,7 +130,11 @@ def _get_backend_priorities(
         elif device_capability.major == 12:
             return [
                 AttentionBackendEnum.TRITON_MLA,
+                # FP8 KV cache only; with BF16 KV it is rejected by
+                # supports_combination and selection falls through to the
+                # Triton sparse backend below.
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+                AttentionBackendEnum.TRITON_MLA_SPARSE,
             ]
         else:
             # NoPE sparse MLA (GLM-5-Next shape: qk_rope_head_dim=0 with an
@@ -169,6 +173,9 @@ def _get_backend_priorities(
                     AttentionBackendEnum.TRITON_MLA,
                     AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
                     *sparse_tail,
+                    # SM8x fallback: every SM90+ sparse backend above rejects
+                    # via supports_compute_capability on Ampere.
+                    AttentionBackendEnum.TRITON_MLA_SPARSE,
                 ]
             return [
                 AttentionBackendEnum.FLASH_ATTN_MLA,
@@ -176,6 +183,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHINFER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
                 *sparse_tail,
+                AttentionBackendEnum.TRITON_MLA_SPARSE,
             ]
     else:
         # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal
