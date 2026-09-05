@@ -584,6 +584,18 @@ class DFlashQwen3Model(nn.Module):
         all_k, all_v = self._project_context_kv(context_states, num_ctx, L, nkv, hd)
         all_k_normed = self._normalize_context_k(all_k)
 
+        import os as _os
+        _tr = _os.environ.get("VLLM_DFLASH_TRACE")
+        _ctxdump = (
+            _tr is not None
+            and context_slot_mapping is not None
+            and _os.path.exists(f"{_tr}/ARM")
+            and getattr(self, "_ctxdump_n", 0) < 40
+        )
+        if _ctxdump:
+            self._ctxdump_n = getattr(self, "_ctxdump_n", 0) + 1
+            _k_prerope0 = all_k_normed[0].clone()
+
         # --- Fused RoPE across all layers ---
         # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
         # In-place RoPE: pass K as the "query" arg with key=None.
@@ -606,6 +618,21 @@ class DFlashQwen3Model(nn.Module):
 
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
+        if _ctxdump:
+            try:
+                torch.save(
+                    {
+                        "states": context_states.float().cpu(),
+                        "pos": context_positions.cpu(),
+                        "k_prerope0": _k_prerope0.float().cpu(),
+                        "k0": all_k_final[0].float().cpu(),
+                        "v0": all_v[0].float().cpu(),
+                        "is_neox": bool(self._rope_is_neox),
+                    },
+                    f"{_tr}/ctxkv_{self._ctxdump_n:04d}.pt",
+                )
+            except Exception as _e:
+                print(f"[CTXKV_DUMP_ERR {_e}]", flush=True)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
         for i in range(L):
             slot_mapping = (
@@ -634,14 +661,41 @@ class DFlashQwen3Model(nn.Module):
 
         hidden_states = input_embeds
 
+        import os as _os
+        _tr = _os.environ.get("VLLM_DFLASH_TRACE")
+        _fwddump = (
+            _tr is not None
+            and _os.path.exists(f"{_tr}/ARM")
+            and getattr(self, "_fwd_n", 0) < 40
+            and hidden_states.shape[0] <= 64
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        _d = None
+        if _fwddump:
+            self._fwd_n = getattr(self, "_fwd_n", 0) + 1
+            _d = {
+                "input_ids": input_ids.cpu(),
+                "positions": positions.cpu(),
+                "embeds": input_embeds.float().cpu(),
+            }
+
         residual = None
-        for layer in self.layers:
+        for _li, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
+            if _d is not None:
+                _d[f"h{_li}"] = hidden_states.float().cpu()
+                _d[f"r{_li}"] = residual.float().cpu()
         hidden_states, _ = self.norm(hidden_states, residual)
+        if _d is not None:
+            _d["final"] = hidden_states.float().cpu()
+            try:
+                torch.save(_d, f"{_tr}/fwd_{self._fwd_n:04d}.pt")
+            except Exception as _e:
+                print(f"[FWD_DUMP_ERR {_e}]", flush=True)
         return hidden_states
 
     def _preprocess(

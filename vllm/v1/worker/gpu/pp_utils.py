@@ -5,6 +5,8 @@
 from collections import deque
 from dataclasses import dataclass
 
+import os
+
 import numpy as np
 import torch
 
@@ -253,6 +255,17 @@ class PPHandler:
             # so skip here to keep the per-step broadcast count matched.
             return
         draft_tokens = draft_tokens.to(torch.int64).contiguous()
+        if os.environ.get("VLLM_PP_DRAFT_DEBUG") == "1":
+            if not hasattr(self, "_dbg_sent"):
+                self._dbg_sent = 0
+            if self._dbg_sent < 6:
+                self._dbg_sent += 1
+                print(
+                    f"[DRAFT_DBG send rank={torch.distributed.get_rank()}] "
+                    f"shape={tuple(draft_tokens.shape)} "
+                    f"row0={draft_tokens[0].tolist() if draft_tokens.numel() else []}",
+                    flush=True,
+                )
         with torch.cuda.stream(self.broadcast_stream):
             # wait_stream so the side-stream broadcast sees propose()'s output.
             self.broadcast_stream.wait_stream(self.main_stream)

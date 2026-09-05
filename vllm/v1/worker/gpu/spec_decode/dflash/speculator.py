@@ -347,10 +347,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
         if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
+            _trace_cat_aux = torch.cat(aux_hidden_states, dim=-1)
+            hidden_states = self.model.combine_hidden_states(_trace_cat_aux)
         else:
+            _trace_cat_aux = None
             hidden_states = last_hidden_states
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
@@ -525,6 +525,35 @@ class DFlashSpeculator(DraftModelSpeculator):
                 f"drafts0={self.draft_tokens[0].tolist()}]",
                 flush=True,
             )
+        import os as _os4
+        _tr = _os4.environ.get("VLLM_DFLASH_TRACE")
+        if _tr and not dummy_run and _os4.path.exists(f"{_tr}/ARM"):
+            if not hasattr(self, "_tr_n"):
+                self._tr_n = 0
+            if self._tr_n < 80:
+                self._tr_n += 1
+                try:
+                    torch.save(
+                        {
+                            "step": self._tr_n,
+                            "num_reqs": num_reqs,
+                            "num_target_tokens": num_target_tokens,
+                            "cat_aux": _trace_cat_aux[:num_target_tokens].float().cpu()
+                            if _trace_cat_aux is not None else None,
+                            "combined": self.hidden_states[:num_target_tokens].float().cpu(),
+                            "context_positions": self.context_positions[:num_target_tokens].cpu(),
+                            "input_ids": self.input_buffers.input_ids[:num_query_tokens].cpu(),
+                            "query_positions": self.input_buffers.positions[:num_query_tokens].cpu(),
+                            "sample_pos": self.sample_pos[:num_reqs].cpu(),
+                            "num_sampled": num_sampled[:num_reqs].cpu(),
+                            "num_rejected": num_rejected[:num_reqs].cpu(),
+                            "last_sampled": last_sampled[:num_reqs].cpu(),
+                            "draft_tokens": self.draft_tokens[:num_reqs].cpu(),
+                        },
+                        f"{_tr}/trace_{self._tr_n:04d}.pt",
+                    )
+                except Exception as _e:
+                    print(f"[DFLASH_TRACE_ERR {_e}]", flush=True)
         return self.draft_tokens[:num_reqs]
 
 

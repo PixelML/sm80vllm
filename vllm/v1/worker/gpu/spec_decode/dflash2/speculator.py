@@ -211,5 +211,28 @@ class DFlash2Speculator(DFlashSpeculator):
             anchor_token_ids,
         )
         self._sample_path(candidate_ids, scores, num_reqs)
+        import os as _os
+        _tr = _os.environ.get("VLLM_DFLASH_TRACE")
+        if (
+            _tr is not None
+            and _os.path.exists(f"{_tr}/ARM")
+            and getattr(self, "_cand_n", 0) < 40
+            and num_reqs <= 4
+        ):
+            self._cand_n = getattr(self, "_cand_n", 0) + 1
+            try:
+                torch.save(
+                    {
+                        "hidden": hidden_states.float().cpu(),
+                        "candidate_ids": candidate_ids.cpu(),
+                        "unary": unary_logits.float().cpu(),
+                        "anchor_ids": anchor_token_ids.cpu(),
+                        "scores": scores.float().cpu(),
+                        "draft_tokens": self.draft_tokens[:num_reqs].cpu(),
+                    },
+                    f"{_tr}/cand_{self._cand_n:04d}.pt",
+                )
+            except Exception as _e:
+                print(f"[CAND_DUMP_ERR {_e}]", flush=True)
         if self.draft_logits is not None:
             self._cache_draft_logits(candidate_ids, num_sample)
