@@ -69,6 +69,11 @@ import os as _os_mb
 _PP_MAX_DECODE_REQS_PER_BATCH = int(
     _os_mb.environ.get("VLLM_PP_MAX_DECODE_REQS_PER_BATCH", "0")
 )
+# Adaptive spec truncation: requests whose accepted-drafts EMA falls below
+# VLLM_ADAPT_SPEC_THRESH verify only VLLM_ADAPT_SPEC_LOW_K drafts per step
+# (fewer target tokens => fewer expert-weight bytes per step). 0 = off.
+_ADAPT_SPEC_LOW_K = int(_os_mb.environ.get("VLLM_ADAPT_SPEC_LOW_K", "0"))
+_ADAPT_SPEC_THRESH = float(_os_mb.environ.get("VLLM_ADAPT_SPEC_THRESH", "1.5"))
 
 
 class Scheduler(SchedulerInterface):
@@ -536,6 +541,14 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (
+                _ADAPT_SPEC_LOW_K > 0
+                and request.spec_token_ids
+                and request.num_computed_tokens >= request.num_prompt_tokens
+                and request.spec_accept_ema < _ADAPT_SPEC_THRESH
+                and len(request.spec_token_ids) > _ADAPT_SPEC_LOW_K
+            ):
+                request.spec_token_ids = request.spec_token_ids[:_ADAPT_SPEC_LOW_K]
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -1813,6 +1826,9 @@ class Scheduler(SchedulerInterface):
                 # tokens). A stale rejection count predates the preemption
                 # rollback and must not apply.
                 if not output_is_stale:
+                    request.spec_accept_ema = (
+                        0.7 * request.spec_accept_ema + 0.3 * num_accepted
+                    )
                     if request.num_computed_tokens > 0:
                         request.num_computed_tokens -= num_rejected
                     if request.num_output_placeholders > 0:
