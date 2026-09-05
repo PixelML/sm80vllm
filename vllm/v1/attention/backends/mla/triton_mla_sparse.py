@@ -82,10 +82,33 @@ class TritonMLASparseImpl(XPUMLASparseImpl):
         attn_metadata: XPUMLASparseMetadata,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
+        _kv_raw_shape = tuple(kv_c_and_k_pe_cache.shape)
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
         topk_indices = topk_indices.view(num_tokens, 1, -1)
+        import os as _os
+        if (
+            _os.environ.get("VLLM_SPARSE_CHECK") == "1"
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # Debug guard (170HX PP8 Xid-31 hunt): validate every index the
+            # sparse kernel will dereference against the kv view it is given.
+            n_slots = kv_c_and_k_pe_cache.shape[0]
+            mx = int(topk_indices.max()); mn = int(topk_indices.min())
+            bt = attn_metadata.block_table
+            bt_max = int(bt.max()) if bt is not None and bt.numel() else -1
+            if not hasattr(self, "_sc_n"):
+                self._sc_n = 0
+            if self._sc_n < 3 or mx >= n_slots or mn < -1:
+                self._sc_n += 1
+                print(f"[SPARSE_CHECK] tokens={num_tokens} idx_min={mn} idx_max={mx} "
+                      f"n_slots={n_slots} kv_raw={_kv_raw_shape} bt_max={bt_max} "
+                      f"bt_shape={tuple(bt.shape) if bt is not None else None} "
+                      f"q={tuple(q.shape)} contig={kv_c_and_k_pe_cache.is_contiguous()} "
+                      f"{'BAD' if (mx >= n_slots or mn < -1) else 'ok'}", flush=True)
+            if mx >= n_slots or mn < -1:
+                topk_indices = topk_indices.clamp(-1, n_slots - 1)
         output = triton_mla_sparse_attention(
             q,
             kv_c_and_k_pe_cache,

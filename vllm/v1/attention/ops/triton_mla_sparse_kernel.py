@@ -118,6 +118,10 @@ def _sparse_mla_compute_tile(
             other=-1,
         )
         mask_kv = (indices >= 0) & (indices < seq_kv)
+        # int64 offsets: with >4.19M kv slots (large KV caches), int32
+        # `indices * stride_kv_token` overflows and faults (Xid 31) even
+        # though the index VALUES pass the mask above.
+        indices = indices.to(tl.int64)
 
         offs_k = (
             indices[None, :] * stride_kv_token
