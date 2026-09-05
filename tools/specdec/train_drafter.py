@@ -131,6 +131,11 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=200)
     ap.add_argument("--eval-every", type=int, default=500)
     ap.add_argument("--init-from", help="resume/curriculum: load a smaller-block checkpoint")
+    ap.add_argument("--shared", required=True,
+                    help="target-shared.safetensors: the target's embed_tokens "
+                         "and lm_head, loaded FROZEN. The drafter shares these "
+                         "at inference, so training its own would tune the "
+                         "layers against a head they are never served with.")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -146,9 +151,33 @@ def main() -> None:
         sd = torch.load(args.init_from, map_location=device)
         print("[init]", model.load_state_dict(sd, strict=False))
 
+    # Load and FREEZE the target's embedding and head.
+    from safetensors.torch import load_file
+
+    shared = load_file(args.shared)
+    for name, mod in (("embed_tokens", model.embed_tokens), ("lm_head", model.lm_head)):
+        w = shared[f"{name}.weight"]
+        if tuple(w.shape) != tuple(mod.weight.shape):
+            raise SystemExit(f"{name}: checkpoint {tuple(w.shape)} vs model "
+                             f"{tuple(mod.weight.shape)}")
+        with torch.no_grad():
+            mod.weight.copy_(w.to(device).bfloat16())
+        mod.weight.requires_grad_(False)
+    frozen_ref = {n: model.get_parameter(n).detach().clone()
+                  for n in ("embed_tokens.weight", "lm_head.weight")}
+    print(f"[shared] loaded and froze embed_tokens + lm_head from {args.shared}")
+
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in trainable)
-    print(f"[model] block_size={cfg.block_size} D={cfg.block_size - 1} params={n_params / 1e9:.3f}B")
+    n_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    print(f"[model] block_size={cfg.block_size} D={cfg.block_size - 1} "
+          f"trainable={n_params / 1e9:.3f}B frozen={n_frozen / 1e9:.3f}B")
+    # The exported artifact is exactly the trainable set; the reference
+    # checkpoint is 1.17B, so a mismatch here means the export and the
+    # optimisation have drifted apart again (run 1's bug).
+    if not 1.0e9 < n_params < 1.35e9:
+        raise SystemExit(f"trainable params {n_params / 1e9:.3f}B outside the "
+                         "expected ~1.17B; embed/lm_head may not be frozen")
 
     opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -169,6 +198,14 @@ def main() -> None:
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         opt.step()
         sched.step()
+
+        if step == 20:
+            for n, ref in frozen_ref.items():
+                cur = model.get_parameter(n)
+                if not torch.equal(cur, ref):
+                    raise SystemExit(f"{n} changed during training; it must stay "
+                                     "bit-identical to the target's copy")
+            print("[frozen] embed_tokens + lm_head bit-identical after 20 steps")
 
         if step % 50 == 0:
             print(f"[{step}/{args.steps}] loss={loss.item():.4f} "
