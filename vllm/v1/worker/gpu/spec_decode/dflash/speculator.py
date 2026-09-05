@@ -419,6 +419,28 @@ class DFlashSpeculator(DraftModelSpeculator):
             context_slots,
         )
 
+        import os as _os
+        if _os.environ.get("VLLM_DFLASH_DEBUG") == "1" and not dummy_run:
+            if not hasattr(self, "_dbg_n"):
+                self._dbg_n = 0
+            if self._dbg_n < 8:
+                self._dbg_n += 1
+                q0 = 0  # request 0 query slot start
+                ids = self.input_buffers.input_ids[
+                    q0 : q0 + self.num_query_per_req
+                ].tolist()
+                print(
+                    f"[DFLASH_DBG step={self._dbg_n} reqs={num_reqs} "
+                    f"tgt_toks={num_target_tokens} "
+                    f"last_sampled0={last_sampled[0].item()} "
+                    f"num_sampled0={num_sampled[0].item()} "
+                    f"num_rejected0={num_rejected[0].item()} "
+                    f"draft_input_ids0={ids} "
+                    f"sample_pos0={self.sample_pos[0].item()} "
+                    f"ctx_pos_tail={self.context_positions[max(0, num_target_tokens - 3):num_target_tokens].tolist()}]",
+                    flush=True,
+                )
+
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.query_cudagraph_manager,
@@ -465,6 +487,15 @@ class DFlashSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
 
+        import os as _os2
+        if _os2.environ.get("VLLM_DFLASH_DEBUG") == "1" and not dummy_run:
+            anchor = self.input_buffers.input_ids[: self.num_query_per_req].tolist()
+            print(
+                f"[DFLASH_DBG pair anchor={anchor} pos={self.sample_pos[0].item()} "
+                f"nrej={num_rejected[0].item()} "
+                f"drafts0={self.draft_tokens[0].tolist()}]",
+                flush=True,
+            )
         return self.draft_tokens[:num_reqs]
 
 
