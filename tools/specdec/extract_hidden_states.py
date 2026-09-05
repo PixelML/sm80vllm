@@ -289,6 +289,13 @@ def main() -> None:
     ap.add_argument("--batch-tokens", type=int, default=8192,
                     help="token budget per batch; keep <= max_num_batched_tokens "
                          "so a batch is one forward pass where possible")
+    ap.add_argument("--raw-dir",
+                    help="where the worker writes its transient per-request .npy "
+                         "before the driver folds it into a shard (default "
+                         "<out>/_raw). Point this at LOCAL disk when --out is on "
+                         "NFS: every token is written, read back and deleted here, "
+                         "so leaving it beside a network --out doubles the traffic "
+                         "for data that never outlives the batch.")
     ap.add_argument("--no-batch", action="store_true",
                     help="force the serial path (~110 tok/s) without trying the "
                          "self-check")
@@ -333,7 +340,12 @@ def main() -> None:
         max_model_len=args.max_len,
         limit_mm_per_prompt={"image": 0, "video": 0},
     )
-    raw_dir = str(out / "_raw")
+    raw_dir = str(pathlib.Path(args.raw_dir) if args.raw_dir else out / "_raw")
+    pathlib.Path(raw_dir).mkdir(parents=True, exist_ok=True)
+    raw_free = (os.statvfs(raw_dir).f_bavail * os.statvfs(raw_dir).f_frsize / 1e9)
+    if raw_free < 5:
+        raise SystemExit(f"refusing: raw dir {raw_dir} has {raw_free:.1f} GB free")
+    print(f"[io] shards -> {out}   transient raw -> {raw_dir} ({raw_free:.0f} GB free)")
     llm.collective_rpc("set_aux_outdir", args=(raw_dir,))
     hooked = llm.collective_rpc("install_aux_hooks", args=(AUX_LAYERS,))
     print("[hooks]", hooked)
