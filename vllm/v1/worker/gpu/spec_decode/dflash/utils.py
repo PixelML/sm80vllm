@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch.nn as nn
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
@@ -49,7 +53,11 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     target_inner = target_language_model.model
     draft_inner = dflash_model.model
 
-    # Skip embedding sharing under PP — each rank owns its own embedding.
+    # Under PP the target embedding lives on rank 0, so the last-rank drafter
+    # cannot share it by reference. In that case load the target embedding
+    # weights from the checkpoint directly into the draft embedding module;
+    # leaving it unloaded silently zero-initializes the draft embeds and
+    # destroys draft quality (anchor/mask tokens become indistinguishable).
     if get_pp_group().world_size == 1:
         target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
             target_inner, "embedding", None
@@ -61,6 +69,50 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             if draft_embed is not None:
                 del draft_inner.embed_tokens
             draft_inner.embed_tokens = target_embed
+    else:
+        draft_embed = getattr(draft_inner, "embed_tokens", None)
+        if draft_embed is not None and not getattr(
+            dflash_model, "has_own_embed_tokens", False
+        ):
+            import json as _json
+            import os as _os
+
+            from safetensors import safe_open as _safe_open
+
+            from vllm.model_executor.model_loader.weight_utils import (
+                default_weight_loader,
+            )
+
+            _tgt = vllm_config.model_config.model
+            _index_path = _os.path.join(_tgt, "model.safetensors.index.json")
+            _idx = _json.load(open(_index_path))["weight_map"]
+            for _name in (
+                "model.language_model.embed_tokens.weight",
+                "model.embed_tokens.weight",
+                "language_model.model.embed_tokens.weight",
+            ):
+                if _name in _idx:
+                    with _safe_open(
+                        _os.path.join(_tgt, _idx[_name]), framework="pt"
+                    ) as _f:
+                        _w = _f.get_tensor(_name)
+                    _loader = getattr(
+                        draft_embed.weight, "weight_loader", default_weight_loader
+                    )
+                    _loader(draft_embed.weight, _w)
+                    logger.info(
+                        "DFlash under PP: loaded target embed_tokens (%s) from "
+                        "checkpoint into the draft (norm=%.4f)",
+                        _name,
+                        draft_embed.weight.data.float().norm().item(),
+                    )
+                    break
+            else:
+                raise RuntimeError(
+                    "DFlash under PP: target embed_tokens not found in "
+                    f"checkpoint index {_index_path}; draft embeds would be "
+                    "zero-initialized."
+                )
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(dflash_model, "lm_head", None)
