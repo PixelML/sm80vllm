@@ -30,6 +30,14 @@ from pack_aux import PackError, pack_aux
 
 AUX_LAYERS = (5, 14, 24, 33, 42)  # dflash_config.target_layer_ids for GLM-5.3-Flash
 HIDDEN = 4096
+
+# Provenance stamp for the captured tensor. The first slice-A extraction hooked
+# the raw layer output, which under mHC is the DEFERRED state: missing that
+# layer's MLP contribution and not stream-contracted. Reference DFlash2 scored
+# 2.5% per-token on it against 36-39% in serving. Anything that consumes a
+# manifest MUST check this field, because the bad data looks healthy under every
+# obvious probe -- it still reads out through lm_head at 28% top-1.
+AUX_TAP = "hc_post-materialized+stream-mean"
 BYTES_PER_TOKEN = len(AUX_LAYERS) * HIDDEN * 2  # bf16
 
 
@@ -189,6 +197,11 @@ def main() -> None:
     ap.add_argument("--tp", type=int, default=4)
     ap.add_argument("--max-len", type=int, default=4096)
     ap.add_argument("--shard-tokens", type=int, default=50_000)
+    ap.add_argument("--resume", action="store_true",
+                    help="continue a partially extracted directory: keep existing "
+                         "shards, skip the corpus rows already consumed, and append. "
+                         "Lets one long extraction be taken across several short "
+                         "GPU windows instead of needing one uninterrupted run.")
     ap.add_argument("--corpus-jsonl", help="pre-tokenizable JSONL "
                     "(one object per line, \"text\" or \"messages\"); "
                     "avoids the `datasets` dependency entirely")
@@ -234,10 +247,35 @@ def main() -> None:
     skipped = 0
     manifest = {"aux_layers": list(AUX_LAYERS), "hidden": HIDDEN,
                 "dtype": "bfloat16", "storage": "int16-view",
-                "model": args.model, "shards": []}
+                "aux_tap": AUX_TAP, "model": args.model,
+                "texts_consumed": 0, "shards": []}
+    consumed = 0
+    man_path = out / "manifest.json"
+    if args.resume and man_path.exists():
+        prev = json.loads(man_path.read_text())
+        if prev.get("aux_tap") != AUX_TAP:
+            raise SystemExit(
+                f"refusing to resume {out}: its manifest says aux_tap="
+                f"{prev.get('aux_tap')!r}, this extractor writes {AUX_TAP!r}. "
+                "Mixing two aux taps in one dataset is silently unrecoverable. "
+                "Extract to a fresh directory.")
+        if prev.get("model") != args.model:
+            raise SystemExit(f"refusing to resume: manifest model {prev.get('model')!r} "
+                             f"!= --model {args.model!r}")
+        manifest = prev
+        shard_idx = len(prev["shards"])
+        consumed = int(prev.get("texts_consumed", 0))
+        done = sum(s["tokens"] for s in prev["shards"])
+        print(f"[resume] {shard_idx} shards, {done} tokens, "
+              f"skipping {consumed} corpus rows already consumed")
+        texts = texts[consumed:]
+    elif args.resume:
+        print(f"[resume] no manifest in {out}; starting fresh")
+
     t0 = time.time()
     total = 0
     for text in texts:
+        consumed += 1
         ids = tok.encode(text)[: args.max_len]
         if len(ids) < 32:
             continue
@@ -269,14 +307,19 @@ def main() -> None:
                      **{f"aux_{i}": s["aux"] for i, s in enumerate(shard)})
             manifest["shards"].append({"file": path.name, "tokens": shard_tokens,
                                        "samples": len(shard)})
+            # Checkpoint the manifest on every shard, not just at the end: a
+            # window that gets cut short then resumes instead of restarting.
+            manifest["texts_consumed"] = consumed
+            man_path.write_text(json.dumps(manifest, indent=2))
             print(f"[shard {shard_idx}] {shard_tokens} tok, {total} total, "
                   f"{total / max(time.time() - t0, 1e-9):.0f} tok/s")
             shard, shard_tokens, shard_idx = [], 0, shard_idx + 1
         if total >= args.tokens:
             break
 
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    print(f"[done] {total} tokens in {shard_idx} shards -> {out}")
+    manifest["texts_consumed"] = consumed
+    man_path.write_text(json.dumps(manifest, indent=2))
+    print(f"[done] +{total} tokens, {shard_idx} shards total -> {out}")
 
 
 if __name__ == "__main__":

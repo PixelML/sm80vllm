@@ -56,10 +56,27 @@ class ShardData:
     reads one member array on demand, so this costs a seek, not memory.
     """
 
-    def __init__(self, root: str, holdout: int = 1):
+    EXPECTED_TAP = "hc_post-materialized+stream-mean"
+
+    def __init__(self, root: str, holdout: int = 1, allow_stale_tap: bool = False):
         self.root = pathlib.Path(root)
         man = json.loads((self.root / "manifest.json").read_text())
         self.aux_layers = man["aux_layers"]
+        self.aux_tap = man.get("aux_tap")
+        if self.aux_tap != self.EXPECTED_TAP and not allow_stale_tap:
+            raise SystemExit(
+                f"{self.root}/manifest.json has aux_tap={self.aux_tap!r}, expected "
+                f"{self.EXPECTED_TAP!r}.\n"
+                "  The original slice-A extraction hooked the raw decoder-layer\n"
+                "  output. Under mHC that is the DEFERRED state: it is missing that\n"
+                "  layer's MLP contribution and is not stream-contracted, so it is\n"
+                "  NOT what the drafter's `fc` was trained on. The reference DFlash2\n"
+                "  checkpoint scores 2.5% per-token on it, against 36-39% in serving.\n"
+                "  It passes every obvious sanity probe -- it still reads out through\n"
+                "  lm_head at 28% top-1 -- which is exactly why this check exists.\n"
+                "  Re-extract with the fixed tap, or pass --allow-stale-tap to\n"
+                "  deliberately reproduce the old numbers."
+            )
         files = sorted(self.root.glob("shard-*.npz"))
         if len(files) <= holdout:
             raise SystemExit(f"need > {holdout} shards, found {len(files)}")
@@ -195,6 +212,9 @@ def main() -> None:
     ap.add_argument("--selector-weight", type=float, default=0.1)
     ap.add_argument("--init-from")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--allow-stale-tap", action="store_true",
+                    help="run against data captured with the pre-fix aux tap; "
+                         "for reproducing old numbers only, never for a release")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -202,7 +222,7 @@ def main() -> None:
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    data = ShardData(args.data)
+    data = ShardData(args.data, allow_stale_tap=args.allow_stale_tap)
     depth = args.block_size - 1
     cfg = DrafterConfig(block_size=args.block_size,
                         num_speculative_tokens=depth,

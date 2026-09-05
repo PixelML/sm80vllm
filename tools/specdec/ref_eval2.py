@@ -108,12 +108,14 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--dtype", default="float32")
     ap.add_argument("--label", default="reference")
+    ap.add_argument("--allow-stale-tap", action="store_true",
+                    help="score against data captured with the pre-fix aux tap")
     ap.add_argument("--out")
     args = ap.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     dtype = getattr(torch, args.dtype)
-    data = ShardData(args.data)
+    data = ShardData(args.data, allow_stale_tap=args.allow_stale_tap)
     cfg = DrafterConfig(block_size=args.block_size,
                         num_speculative_tokens=args.depth,
                         target_layer_ids=tuple(data.aux_layers))
