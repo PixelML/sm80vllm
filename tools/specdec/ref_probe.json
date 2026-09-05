@@ -1,0 +1,38 @@
+{
+  "depth": 7,
+  "blocks": 40,
+  "per_position_conditional": [
+    0.05,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "per_position_prefix": [
+    0.05,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "mean_accepted_length": 1.05,
+  "mean_accepted_length_check": 1.05,
+  "label": "reference",
+  "convention": "runtime",
+  "per_token_acceptance": 0.025,
+  "per_position_acceptance": [
+    0.05,
+    0.025,
+    0.0,
+    0.0,
+    0.05,
+    0.0,
+    0.05
+  ],
+  "predicted_tok_s_V0": 16.94,
+  "predicted_tok_s_V296": 14.11
+}

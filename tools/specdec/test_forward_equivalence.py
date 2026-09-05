@@ -217,6 +217,49 @@ def main():
     theirs_b = fork_dflash.DFlashQwen3Model.forward(duck_b, q_ids, q_pos)
     check("block forward (bf16)", theirs_b, mine_b, TOL_BF16)
 
+    # ---- 4b. batched training path == per-block serving path -------------
+    # The trainer flattens n_blocks query blocks of exactly conv_block_size rows.
+    # That is only legitimate if it is bit-identical to running them one at a
+    # time, which is what `_grouped_conv`'s per-block position reset buys.
+    n_blk = 5
+    anchors = torch.arange(nctx - n_blk, nctx)
+    q_len = 1 + d
+    bq_ids = torch.stack([model.build_query_ids(1000 + i, "cpu") for i in range(n_blk)])
+    bq_pos = anchors[:, None] + torch.arange(q_len)[None, :]
+    ctx_ok = ctx_pos[None, None, :] < anchors[:, None, None]
+    ctx_ok = ctx_ok.expand(n_blk, q_len, nctx)
+    qq = torch.ones(n_blk, q_len, q_len, dtype=torch.bool)
+    bmask = torch.cat([ctx_ok, qq], dim=-1).unsqueeze(1)
+    batched = model.forward_blocks(bq_ids, bq_pos, ctx_kv, bmask, n_blocks=n_blk)
+    batched = batched.view(n_blk, q_len, -1)
+    singles = []
+    for i in range(n_blk):
+        a = int(anchors[i])
+        kv = [(k[:a], v[:a]) for k, v in ctx_kv]
+        singles.append(model.forward_block(bq_ids[i], bq_pos[i], kv, ctx_pos[:a]))
+    # fp32 GEMM/SDPA reduction order differs between a [B,h,Q,d] batch and B
+    # separate [1,h,Q,d] calls, so this is a numerical-agreement check, not a
+    # bitwise one. The structural claim -- no leakage across block boundaries --
+    # is proved separately, and exactly, below.
+    check("batched blocks ~= per-block", torch.stack(singles), batched, 2e-3)
+
+    # Cross-block isolation: perturbing block 0's tokens must leave every other
+    # block BITWISE unchanged. This is what makes flattening legitimate; if the
+    # conv's per-block position reset or the attention mask were wrong, the
+    # tap-1 shift or attention would carry block 0 into block 1 and this would
+    # move. Exact zero is the only acceptable answer.
+    poked = bq_ids.clone()
+    poked[0, 0] = 4242
+    batched2 = model.forward_blocks(poked, bq_pos, ctx_kv, bmask,
+                                    n_blocks=n_blk).view(n_blk, q_len, -1)
+    delta0 = float((batched2[0] - batched[0]).abs().max())
+    delta_rest = float((batched2[1:] - batched[1:]).abs().max())
+    ok = delta_rest == 0.0 and delta0 > 0.0
+    print(f"{'PASS' if ok else 'FAIL'}  {'cross-block isolation (exact)':<44} "
+          f"block0 moved={delta0:.3e} blocks1-4 moved={delta_rest:.3e}")
+    if not ok:
+        FAILS.append("cross-block isolation")
+
     # ---- 5. sanity: the hidden state must not explode ---------------------
     std = float(mine.float().std())
     print(f"\nfinal hidden std = {std:.4f}  (v2's bug produced 2.8e11)")

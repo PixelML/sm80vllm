@@ -77,6 +77,48 @@ class DrafterConfig:
         # qwen3_dflash2.py: block_size=1 + speculative_config.num_speculative_tokens
         return 1 + self.num_speculative_tokens
 
+    def to_hf(self) -> dict:
+        """config.json for the vLLM `DFlash2DraftModel` loader path."""
+        return {
+            "architectures": ["DFlash2DraftModel"],
+            "model_type": "qwen3",
+            "attention_bias": False,
+            "attention_dropout": 0.0,
+            "bos_token_id": None,
+            "dflash_config": {
+                "block_size": self.block_size,
+                "conv_group_size": self.conv_group_size,
+                "conv_kernel_size": self.conv_kernel_size,
+                "mask_token_id": self.mask_token_id,
+                "selector_rank": self.selector_rank,
+                "selector_top_k": self.selector_top_k,
+                "target_layer_ids": list(self.target_layer_ids),
+            },
+            "dtype": "bfloat16",
+            "eos_token_id": [154820, 154827, 154829],
+            "head_dim": self.head_dim,
+            "hidden_act": "silu",
+            "hidden_size": self.hidden_size,
+            "initializer_range": 0.02,
+            "intermediate_size": self.intermediate_size,
+            "is_causal": self.causal,
+            "layer_types": ["sliding_attention"] * self.num_hidden_layers,
+            "max_position_embeddings": 1048576,
+            "max_window_layers": self.num_hidden_layers,
+            "num_attention_heads": self.num_attention_heads,
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_key_value_heads": self.num_key_value_heads,
+            "num_target_layers": self.num_target_layers,
+            "pad_token_id": 154820,
+            "rms_norm_eps": self.rms_norm_eps,
+            "rope_parameters": {"rope_theta": self.rope_theta, "rope_type": "default"},
+            "sliding_window": self.sliding_window,
+            "tie_word_embeddings": False,
+            "use_cache": False,
+            "use_sliding_window": True,
+            "vocab_size": self.vocab_size,
+        }
+
 
 class RMSNorm(nn.Module):
     """vLLM `RMSNorm`, both call shapes.
@@ -237,32 +279,52 @@ class DFlashAttention(nn.Module):
         k = _apply_rope(k, cos, sin, self.is_neox_style)
         return k, v
 
-    def forward(self, hidden_states, positions, ctx_k, ctx_v, attn_mask):
-        t = hidden_states.shape[0]
-        q = self.q_proj(hidden_states).view(t, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(t, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(t, self.num_kv_heads, self.head_dim)
+    def forward(self, hidden_states, positions, ctx_k, ctx_v, attn_mask, n_blocks=1):
+        """hidden_states: [n_blocks * Q, H] flattened, as in the runtime.
+
+        The conv and the norms stay flat -- flattening `n_blocks` query blocks of
+        exactly `conv_block_size` rows is bit-identical to running them one block
+        at a time, because `_grouped_conv` resets `position` on every block
+        boundary and zeroes the tap-1 shift there. Only attention needs the
+        batch axis, since each block attends to its own context slice.
+
+        ctx_k/ctx_v: [C, nkv, hd] shared by every block, or [n_blocks, C, nkv, hd].
+        attn_mask:   [n_blocks, 1, Q, C + Q] boolean.
+        """
+        n = hidden_states.shape[0]
+        b = n_blocks
+        q_len = n // b
+        q = self.q_proj(hidden_states).view(n, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(n, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(n, self.num_kv_heads, self.head_dim)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        cos, sin = _rope_cos_sin(positions, self.theta, self.head_dim, q.device)
+        cos, sin = _rope_cos_sin(positions.reshape(-1), self.theta, self.head_dim, q.device)
         q = _apply_rope(q, cos, sin, self.is_neox_style)
         k = _apply_rope(k, cos, sin, self.is_neox_style)
 
+        # [B, heads, Q, hd]
+        q = q.view(b, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(b, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(b, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
         if ctx_k is not None:
-            k = torch.cat([ctx_k, k], dim=0)
-            v = torch.cat([ctx_v, v], dim=0)
+            ck, cv = ctx_k, ctx_v
+            if ck.dim() == 3:
+                ck, cv = ck.unsqueeze(0), cv.unsqueeze(0)
+            if ck.shape[0] == 1 and b > 1:
+                ck, cv = ck.expand(b, -1, -1, -1), cv.expand(b, -1, -1, -1)
+            k = torch.cat([ck.transpose(1, 2), k], dim=2)
+            v = torch.cat([cv.transpose(1, 2), v], dim=2)
+
         rep = self.num_heads // self.num_kv_heads
         k = k.repeat_interleave(rep, dim=1)
         v = v.repeat_interleave(rep, dim=1)
 
         o = F.scaled_dot_product_attention(
-            q.transpose(0, 1).unsqueeze(0),
-            k.transpose(0, 1).unsqueeze(0),
-            v.transpose(0, 1).unsqueeze(0),
-            attn_mask=attn_mask,
-            scale=self.scaling,
+            q, k, v, attn_mask=attn_mask, scale=self.scaling
         )
-        return self.o_proj(o.squeeze(0).transpose(0, 1).reshape(t, -1))
+        return self.o_proj(o.transpose(1, 2).reshape(n, -1))
 
 
 class Qwen3MLP(nn.Module):
@@ -288,7 +350,8 @@ class DFlash2DecoderLayer(nn.Module):
         self.attention_conv = DFlashGroupedConv(cfg)
         self.mlp_conv = DFlashGroupedConv(cfg)
 
-    def forward(self, positions, hidden_states, residual, ctx_k, ctx_v, attn_mask):
+    def forward(self, positions, hidden_states, residual, ctx_k, ctx_v, attn_mask,
+                n_blocks=1):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -296,7 +359,9 @@ class DFlash2DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
-        hidden_states = self.self_attn(hidden_states, positions, ctx_k, ctx_v, attn_mask)
+        hidden_states = self.self_attn(
+            hidden_states, positions, ctx_k, ctx_v, attn_mask, n_blocks
+        )
         hidden_states = self.attention_conv.finish(hidden_states, coefficients)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -425,13 +490,19 @@ class DFlash2Drafter(nn.Module):
         return m.view(1, 1, nq, nc + nq)
 
     def forward_block(self, input_ids, positions, ctx_kv, context_positions):
-        """`DFlashQwen3Model.forward` over the 1+D query slots."""
-        hidden_states = self.embed_input_ids(input_ids)
-        attn_mask = self.query_attn_mask(positions, context_positions)
+        """`DFlashQwen3Model.forward` over the 1+D query slots of ONE block."""
+        return self.forward_blocks(
+            input_ids, positions, ctx_kv,
+            self.query_attn_mask(positions, context_positions), n_blocks=1,
+        )
+
+    def forward_blocks(self, input_ids, positions, ctx_kv, attn_mask, n_blocks=1):
+        """`DFlashQwen3Model.forward` over `n_blocks` flattened query blocks."""
+        hidden_states = self.embed_input_ids(input_ids.reshape(-1))
         residual = None
         for layer, (ck, cv) in zip(self.layers, ctx_kv):
             hidden_states, residual = layer(
-                positions, hidden_states, residual, ck, cv, attn_mask
+                positions, hidden_states, residual, ck, cv, attn_mask, n_blocks
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
