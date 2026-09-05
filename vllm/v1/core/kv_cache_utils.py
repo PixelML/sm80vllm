@@ -1411,6 +1411,63 @@ def _pp_balanced_mamba_group_count(
     return num_groups
 
 
+GLM5N_SIDECAR_BLOCK_SIZE_ENV = "VLLM_GLM5N_SIDECAR_BLOCK_SIZE"
+GLM5N_SIDECAR_BLOCK_SIZE_DEFAULT = 256
+
+
+def _reblock_glm5n_sidecar_specs(
+    sidecar_specs: dict[str, KVCacheSpec],
+) -> dict[str, KVCacheSpec]:
+    """Raise the block size of sidecar (DFlash draft attention) specs.
+
+    Block ids come from one shared BlockPool, and *every* block id costs the
+    full core page (MLA + indexer) on *every* rank, whether the id is owned
+    by a core layer or by a sidecar layer. The draft's SlidingWindowSpec picks
+    the backend's smallest kernel block (16 tokens), so one max-length request
+    needs ~2.4k sidecar block ids for its ~39k-token window + in-flight
+    reservation -- ~9x the ~280 ids the core needs for 1M tokens -- and each
+    of those ids drags an empty 4.5 MiB MLA page along on every rank
+    (measured: 1M concurrency 1.13x, ~90% of the pool idle).
+
+    Re-blocking the sidecar to 256 tokens cuts that to ~150 ids (1M
+    concurrency ~7x at equal memory). The cost is a larger sidecar page on
+    the rank holding the draft (5 layers x 256 x 4 KiB = 5 MiB per block).
+    Override with VLLM_GLM5N_SIDECAR_BLOCK_SIZE (multiple of 16; 0 disables).
+    """
+    raw = os.environ.get(GLM5N_SIDECAR_BLOCK_SIZE_ENV)
+    block_size = GLM5N_SIDECAR_BLOCK_SIZE_DEFAULT if raw in (None, "") else int(raw)
+    if block_size <= 0:
+        return sidecar_specs
+    if block_size % 16:
+        raise ValueError(
+            f"{GLM5N_SIDECAR_BLOCK_SIZE_ENV}={block_size} must be a multiple of 16"
+        )
+    out: dict[str, KVCacheSpec] = {}
+    changed: list[tuple[str, int, int]] = []
+    for name, spec in sidecar_specs.items():
+        if (
+            not isinstance(spec, AttentionSpec)
+            or spec.page_size_padded is not None
+            or spec.block_size >= block_size
+        ):
+            out[name] = spec
+            continue
+        out[name] = replace(spec, block_size=block_size)
+        changed.append((name, spec.block_size, block_size))
+    if changed:
+        logger.info_once(
+            "glm5n sidecar re-block: %d layer(s) %d -> %d tokens/block "
+            "(page %d -> %d bytes); set %s to override",
+            len(changed),
+            changed[0][1],
+            changed[0][2],
+            sidecar_specs[changed[0][0]].page_size_bytes,
+            out[changed[0][0]].page_size_bytes,
+            GLM5N_SIDECAR_BLOCK_SIZE_ENV,
+        )
+    return out
+
+
 def _get_kv_cache_groups_glm5_next(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -1502,6 +1559,7 @@ def _get_kv_cache_groups_glm5_next(
         mamba_grouped_names[k % num_groups].append(name)
     sidecar_groups: list[KVCacheGroupSpec] = []
     if sidecar_specs:
+        sidecar_specs = _reblock_glm5n_sidecar_specs(sidecar_specs)
         by_spec: dict[KVCacheSpec, list[str]] = {}
         for name, spec in sidecar_specs.items():
             by_spec.setdefault(spec, []).append(name)
