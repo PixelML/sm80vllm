@@ -69,8 +69,14 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             dtype=torch.int32,
             device=current_platform.device_type,
         )
+        # The draft head is filled from the checkpoint BF16 lm_head.weight
+        # (see load_weights). Quantized checkpoints (e.g. ModelOpt NVFP4) keep
+        # lm_head unquantized via their ignore list, but the MTP head prefix
+        # (model.layers.N.shared_head.head) does not match that list, so the
+        # quant method would allocate a packed FP4 param (hidden/2 wide) and
+        # the BF16 copy fails with a shape mismatch. Always build it BF16.
         self.shared_head = SharedHead(
-            config=config, prefix=prefix, quant_config=quant_config
+            config=config, prefix=prefix, quant_config=None
         )
         # MTP layers sit past the base model's hidden layers; parse the index
         # from the prefix (e.g. "...layers.32") so the decoder builds an MLA
