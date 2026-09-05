@@ -528,7 +528,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         import os as _os4
         _tr = _os4.environ.get("VLLM_DFLASH_TRACE")
         if _tr and not dummy_run and _os4.path.exists(f"{_tr}/ARM"):
-            if not hasattr(self, "_tr_n"):
+            _arm_mtime = _os4.path.getmtime(f"{_tr}/ARM")
+            if getattr(self, "_tr_arm", None) != _arm_mtime:
+                # New ARM file (touched again) => fresh 80-step budget.
+                self._tr_arm = _arm_mtime
                 self._tr_n = 0
             if self._tr_n < 80:
                 self._tr_n += 1
