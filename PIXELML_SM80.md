@@ -5,7 +5,7 @@ SM80 (Ampere: CMP 170HX, A100, RTX 3090) serving branch for GLM-5.3-Flash and De
 ## Origin
 
 - **Base:** [Morrowmake/vllm-cmp170hx](https://github.com/Morrowmake/vllm-cmp170hx) branch `ampere-glm53` @ `378c37b0098a41a5cd25b3bf8b56d158e33a6cbf`, the engine pinned by [glm53-flash-cmp170hx-recipe](https://github.com/Morrowmake/glm53-flash-cmp170hx-recipe) v1.4.1. Its 102 commits sit on upstream vLLM `e55d076f89` (2026-09-25) and are kept unmodified, with original authorship. Licence: Apache-2.0, same as vLLM (see `LICENSE`).
-- **PixelML additions** (commits after this file): DeepSeek-V4 sparse MLA on SM8x, forward-ported from this repo's `sm80` branch (`f8ea5bb16`); its Triton backend is registered as `TRITON_MLA_SPARSE_DSV4` so it coexists with Morrowmake's DSA `TRITON_MLA_SPARSE`.
+- **DeepSeek-V4 on SM8x:** merge of upstream [vllm-project/vllm#55184](https://github.com/vllm-project/vllm/pull/55184) (mikekg, head `7f82bb7486`): software fp8 e4m3, Triton sparse-MLA and paged MQA-logits fallbacks for DeepSeek-V4 Flash/Pro without DeepGEMM. It replaces this repo's older `sm80` commit `f8ea5bb16` (same fixes on an August base; 16 conflicts here versus 3). Where both sides add `TRITON_MLA_SPARSE`, Morrowmake's DSA backend is kept for GLM-5.3 / V3.2; DeepSeek-V4 reaches the PR's kernels through its own model path. Resolution notes are in the merge commit.
 
 ## Measured
 
