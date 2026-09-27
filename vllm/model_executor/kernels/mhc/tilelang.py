@@ -792,12 +792,13 @@ def mhc_pre_broadcast_tilelang(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
     )
 
+    # The broadcast GEMM reduces over hidden_size only (K has no hc_mult
+    # factor), so the non-DeepGEMM fallbacks (SM8x) must see hc_mult=1.
     gemm_out_mul, gemm_out_sqrsum = _hc_prenorm_gemm_outputs(
         residual_flat,
         fn_broadcast,
         hidden_size=hidden_size,
-        hc_mult=hc_mult,
-        use_tilelang_fallback=False,
+        hc_mult=1,
     )
     _MHC_PRE_BIG_FUSE_TILELANG_KERNEL(
         gemm_out_mul,
