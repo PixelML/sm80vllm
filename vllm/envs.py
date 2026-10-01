@@ -211,6 +211,9 @@ if TYPE_CHECKING:
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
     VLLM_GLM5_DFLASH_ADAPTIVE_K: bool = False
+    VLLM_GLM5_COPY_DRAFTS: bool = False
+    VLLM_GLM5_COPY_MATCH: int = 8
+    VLLM_GLM5_COPY_REPLY_MATCH: int = 16
     VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS: str = "5,4"
     VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG: int = 0
     VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH: bool = False
@@ -1866,6 +1869,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # num_speculative_tokens applies. Off: the configured depth every step.
     "VLLM_GLM5_DFLASH_ADAPTIVE_K": lambda: bool(
         int(os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K", "0"))
+    ),
+    # Copy (prompt-lookup) drafts ahead of the draft model's: when the last
+    # COPY_MATCH tokens occurred in the prompt (COPY_REPLY_MATCH in the reply
+    # itself), the tokens that followed replace the step's draft block.
+    # Verified like any draft: same replies. Off: draft model only.
+    "VLLM_GLM5_COPY_DRAFTS": lambda: bool(
+        int(os.getenv("VLLM_GLM5_COPY_DRAFTS", "0"))
+    ),
+    "VLLM_GLM5_COPY_MATCH": lambda: int(os.getenv("VLLM_GLM5_COPY_MATCH", "8")),
+    "VLLM_GLM5_COPY_REPLY_MATCH": lambda: int(
+        os.getenv("VLLM_GLM5_COPY_REPLY_MATCH", "16")
     ),
     "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS": lambda: os.getenv(
         "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS", "5,4"

@@ -149,6 +149,7 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
+from vllm.v1.worker.gpu.spec_decode.copy_drafts import CopyDrafts
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
     maybe_create_adaptive_verification_manager,
@@ -336,6 +337,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_prefill_lookahead=num_prefill_lookahead,
         )
         self.adaptive_verification: AdaptiveVerificationManager | None = None
+        self.copy_drafts: CopyDrafts | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -728,6 +730,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
         )
+        if envs.VLLM_GLM5_COPY_DRAFTS and self.copy_drafts is None:
+            if not isinstance(self.speculator, DraftModelSpeculator):
+                logger.warning("Copy drafts need a draft-model speculator: off")
+            elif self.speculator.draft_logits is not None:
+                logger.warning("Copy drafts with probabilistic draft sampling: off")
+            elif self.adaptive_verification is not None:
+                logger.warning("Copy drafts with adaptive verification: off")
+            elif self.draft_tail is not None:
+                logger.warning("Copy drafts with a remote draft tail: off")
+            else:
+                self.copy_drafts = CopyDrafts(
+                    self.max_num_reqs,
+                    self.max_model_len,
+                    self.device,
+                    envs.VLLM_GLM5_COPY_MATCH,
+                    envs.VLLM_GLM5_COPY_REPLY_MATCH,
+                )
 
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -1264,6 +1283,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
+            if self.copy_drafts is not None:
+                self.copy_drafts.add_request(req_index)
 
             if self.pooling_runner is not None:
                 assert new_req_data.pooling_params is not None
@@ -2345,6 +2366,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dp_sync=dp_sync,
                     mm_inputs=mm_inputs,
                     **propose_kwargs,
+                )
+            if self.copy_drafts is not None and not remote_tail:
+                self.copy_drafts.apply(
+                    draft_tokens,
+                    input_batch.idx_mapping,
+                    self.req_states.all_token_ids.gpu,
+                    self.req_states.total_len.gpu,
+                    self.req_states.prompt_len.gpu,
                 )
             if remote_tail:
                 # The tail stage roots this step's drafts; they reach the
