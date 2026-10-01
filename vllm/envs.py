@@ -210,6 +210,16 @@ if TYPE_CHECKING:
     VLLM_GLM5_MOE_ROUTE_V2_MASK: bool = True
     VLLM_GLM5_THIN_GEMM: bool = False
     VLLM_GLM5_DRAFTER_ROPE_FIT: bool = False
+    VLLM_GLM5_DFLASH_ADAPTIVE_K: bool = False
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS: str = "5,4"
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG: int = 0
+    VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH: bool = False
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT: bool = False
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS: str = ""
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST: float = 0.03
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI: str = ""
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR: float = 0.75
+    VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE: str = ""
     VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = True
     VLLM_GLM5_INDEXER_DECODE_ROWS: bool = False
     VLLM_GLM5_DRAFTER_SELECTOR_SHARD: bool = False
@@ -241,6 +251,9 @@ if TYPE_CHECKING:
     VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS: int = 384
     VLLM_GLM5_TP4_MARLIN_PREFILL: bool = False
     VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS: int = 384
+    VLLM_GLM5_MARLIN_DECODE_CUDA: bool = False
+    VLLM_GLM5_MARLIN_PREFILL_CUDA: bool = False
+    VLLM_GLM5_MARLIN_DECODE_VARIANT: str = "orig"
     VLLM_GLM5_HOST_ALLREDUCE: bool = False
     VLLM_GLM5_HOST_ALLREDUCE_MAX_SIZE: int = 512 * 1024
     VLLM_GLM5_HOST_ALLREDUCE_BUILD_DIR: str | None = None
@@ -1846,6 +1859,55 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_DRAFTER_ROPE_FIT": lambda: bool(
         int(os.getenv("VLLM_GLM5_DRAFTER_ROPE_FIT", "0"))
     ),
+    # Load-adaptive DFlash draft depth. The drafter produces the widest block
+    # every step and each step verifies a prefix whose length follows the
+    # number of requests in the server: VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS
+    # lists the depth for 1, 2, ... requests; beyond the list the configured
+    # num_speculative_tokens applies. Off: the configured depth every step.
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K", "0"))
+    ),
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS": lambda: os.getenv(
+        "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS", "5,4"
+    ),
+    # With VLLM_GLM5_DFLASH_ADAPTIVE_K: the drafter drafts only the depth the
+    # next step verifies (one drafter graph set per depth) instead of the
+    # deepest block every step. Off: the deepest block, prefix verified.
+    "VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH", "0"))
+    ),
+    # With VLLM_GLM5_DFLASH_ADAPTIVE_K: choose each step's depth from load
+    # and from recent draft acceptance (expected tokens per unit step cost);
+    # predictable text keeps the deep drafts, prose falls back. Costs: the
+    # relative step cost per draft count (ascending), empty = the layout
+    # default; HYST: the margin a new depth must win by.
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT": lambda: bool(
+        int(os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT", "0"))
+    ),
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS": lambda: os.getenv(
+        "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS", ""
+    ),
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST": lambda: float(
+        os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST", "0.03")
+    ),
+    # Per-draft acceptance a new request starts from (fixed; never adapted at
+    # run time, so a request alone repeats exactly).
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR": lambda: float(
+        os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR", "0.75")
+    ),
+    # Relative step costs for steps of two or more requests (empty: COSTS).
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI": lambda: os.getenv(
+        "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI", ""
+    ),
+    # Diagnostics (step-cost calibration): a file holding a depth; while it
+    # holds one inside the load width, every step verifies that depth.
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE": lambda: os.getenv(
+        "VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE", ""
+    ),
+    # Chosen-depth histogram every N scheduler steps (0 = off).
+    "VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG": lambda: int(
+        os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG", "0")
+    ),
     # Size the sparse indexer's K-gather workspace (and the metadata builder's
     # chunk limit) by what one step can gather, max_num_seqs *
     # cdiv(max_model_len, compress_ratio), instead of the 40 * max_model_len
@@ -1987,6 +2049,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_GLM5_TP4_MARLIN_PREFILL_MIN_TOKENS", "384")
+    ),
+    # Optional prebuilt sm_80 Marlin kernels. Enabling either flag requires
+    # vllm._ampere_marlin_C; startup fails if it is missing or incompatible.
+    "VLLM_GLM5_MARLIN_DECODE_CUDA": lambda: bool(
+        int(os.getenv("VLLM_GLM5_MARLIN_DECODE_CUDA", "0"))
+    ),
+    "VLLM_GLM5_MARLIN_PREFILL_CUDA": lambda: bool(
+        int(os.getenv("VLLM_GLM5_MARLIN_PREFILL_CUDA", "0"))
+    ),
+    # Reduction order of the compiled decode kernels when
+    # VLLM_GLM5_MARLIN_DECODE_CUDA is on: "orig" (default) splits the w13
+    # projection four ways along K (faster, different fp32 summation order);
+    # "exact" keeps the released Marlin summation order.
+    "VLLM_GLM5_MARLIN_DECODE_VARIANT": env_with_choices(
+        "VLLM_GLM5_MARLIN_DECODE_VARIANT", "orig", ["orig", "exact"]
     ),
     # Host-staged all-reduce for PCIe-only multi-GPU nodes with no peer access
     # (the CMP 170HX case). Off by default. When on it stands aside only if

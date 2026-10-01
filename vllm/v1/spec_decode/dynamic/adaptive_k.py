@@ -24,7 +24,8 @@ logger = init_logger(__name__)
 
 # Keys accepted in the ``adaptive_k`` speculative-config mapping.
 _CONFIG_KEYS = frozenset(
-    {"min", "max", "ema", "margin", "quantile", "allowed", "log_interval"}
+    {"min", "max", "ema", "margin", "quantile", "allowed", "log_interval", "by_load",
+     "draft_by_load", "accept"}
 )
 
 
@@ -41,6 +42,53 @@ class AdaptiveKConfig:
     # CUDA graphs must be captured for. Always sorted, always ends at max_k.
     allowed: tuple[int, ...] = ()
     log_interval: int = 0
+    # Load mode: the verification width for 1, 2, ... requests in the server;
+    # the last entry covers every larger count. Empty: acceptance mode.
+    by_load: tuple[int, ...] = ()
+    # Load mode: also draft only the width the next step verifies (the
+    # drafter must support per-width drafting; otherwise it drafts its full
+    # block and the scheduler still verifies the load width).
+    draft_by_load: bool = False
+    # Load mode: also weigh recent draft acceptance (acceptance-aware depth).
+    # accept_costs[i] is the relative step cost of verifying allowed[i]
+    # drafts; the step takes the depth (at most the load width) that
+    # maximises expected tokens per unit cost over the batch.
+    accept: bool = False
+    accept_costs: tuple[float, ...] = ()
+    # Costs for steps of two or more requests (empty: accept_costs).
+    accept_costs_multi: tuple[float, ...] = ()
+    accept_hysteresis: float = 0.03
+    accept_prior: float = 0.75
+    accept_decay: float = 0.9
+    accept_strength: float = 2.0
+
+    @property
+    def load_mode(self) -> bool:
+        return bool(self.by_load)
+
+    def k_for_load(self, num_reqs: int) -> int:
+        """Verification width for ``num_reqs`` requests (load mode)."""
+        assert self.by_load
+        return self.by_load[min(max(num_reqs, 1), len(self.by_load)) - 1]
+
+    def max_reqs_for(self, k: int, max_num_reqs: int) -> int:
+        """Largest request count at which ``k`` is verified, so decode CUDA
+        graphs for ``k`` are needed only up to it. Every count in acceptance
+        mode; 0 when load mode never picks ``k``."""
+        if not self.by_load:
+            return max_num_reqs
+        if k not in self.allowed:
+            return 0
+        if k <= self.by_load[-1]:
+            return max_num_reqs
+        # A step verifies at most the load width, so depth k runs only while
+        # the load width is at least k (exactly the load width without the
+        # acceptance-aware choice, which then only lists load widths).
+        widest = 0
+        for n, value in enumerate(self.by_load, start=1):
+            if value >= k:
+                widest = n
+        return min(widest, max_num_reqs)
 
     @classmethod
     def from_dict(cls, raw: Any, num_speculative_tokens: int) -> "AdaptiveKConfig":
@@ -100,6 +148,87 @@ class AdaptiveKConfig:
         if log_interval < 0:
             raise ValueError("adaptive_k.log_interval must be >= 0.")
 
+        raw_by_load = raw.get("by_load")
+        by_load: tuple[int, ...] = ()
+        if raw_by_load is not None:
+            if not isinstance(raw_by_load, (list, tuple)) or not raw_by_load:
+                raise ValueError(
+                    "adaptive_k.by_load must be a non-empty list of draft "
+                    "counts (for 1, 2, ... requests; the last covers the rest)."
+                )
+            by_load = tuple(int(k) for k in raw_by_load)
+            illegal = sorted(
+                {k for k in by_load if not 1 <= k <= num_speculative_tokens}
+            )
+            if illegal:
+                raise ValueError(
+                    f"adaptive_k.by_load contains {illegal}, outside "
+                    f"[1, num_speculative_tokens={num_speculative_tokens}]."
+                )
+            if "allowed" in raw or "min" in raw or "max" in raw:
+                raise ValueError(
+                    "adaptive_k.by_load names the draft counts itself; drop "
+                    "allowed/min/max."
+                )
+            allowed = tuple(sorted(set(by_load)))
+            accept_kwargs: dict[str, Any] = {}
+            raw_accept = raw.get("accept")
+            if raw_accept is not None:
+                if not isinstance(raw_accept, dict):
+                    raise ValueError("adaptive_k.accept must be a mapping.")
+                # The acceptance-aware choice may pick any depth from the
+                # shallowest load width up to the deepest one.
+                allowed = tuple(range(min(by_load), max(by_load) + 1))
+                costs = tuple(float(c) for c in raw_accept.get("costs", ()))
+                if len(costs) != len(allowed) or min(costs, default=0.0) <= 0:
+                    raise ValueError(
+                        f"adaptive_k.accept.costs needs one positive cost per "
+                        f"draft count {list(allowed)}, got {list(costs)}."
+                    )
+                costs_multi = tuple(
+                    float(c) for c in raw_accept.get("costs_multi", ()) or ()
+                )
+                if costs_multi and (
+                    len(costs_multi) != len(allowed) or min(costs_multi) <= 0
+                ):
+                    raise ValueError(
+                        f"adaptive_k.accept.costs_multi needs one positive cost "
+                        f"per draft count {list(allowed)}, got {list(costs_multi)}."
+                    )
+                hysteresis = float(raw_accept.get("hysteresis", 0.03))
+                prior = float(raw_accept.get("prior", 0.75))
+                decay = float(raw_accept.get("decay", 0.9))
+                if not 0.0 <= hysteresis < 1.0:
+                    raise ValueError("adaptive_k.accept.hysteresis must be in [0, 1).")
+                if not 0.0 < prior < 1.0 or not 0.0 <= decay < 1.0:
+                    raise ValueError(
+                        "adaptive_k.accept.prior must be in (0, 1) and decay in [0, 1)."
+                    )
+                accept_kwargs = dict(
+                    accept=True,
+                    accept_costs=costs,
+                    accept_costs_multi=costs_multi,
+                    accept_hysteresis=hysteresis,
+                    accept_prior=prior,
+                    accept_decay=decay,
+                )
+            return cls(
+                min_k=min(by_load),
+                max_k=max(by_load),
+                ema=ema,
+                margin=margin,
+                quantile=quantile,
+                allowed=allowed,
+                log_interval=log_interval,
+                by_load=by_load,
+                draft_by_load=bool(raw.get("draft_by_load", False)),
+                **accept_kwargs,
+            )
+
+        if raw.get("draft_by_load"):
+            raise ValueError("adaptive_k.draft_by_load needs adaptive_k.by_load.")
+        if raw.get("accept") is not None:
+            raise ValueError("adaptive_k.accept needs adaptive_k.by_load.")
         raw_allowed = raw.get("allowed")
         if raw_allowed is None:
             candidates = list(range(1, num_speculative_tokens + 1))
@@ -152,6 +281,20 @@ class AdaptiveKPolicy:
     # rejected by construction, so their result is not evidence about
     # acceptance; see :meth:`mark_padded`.
     _pending_padded: dict[str, int] = field(default_factory=dict)
+    # Acceptance-aware depth: per request, decayed counts of accepted drafts
+    # and of rejections (a geometric model of per-draft acceptance; a step
+    # whose drafts were all accepted adds successes and no failure, so no
+    # censoring correction is needed). A request's depth depends only on its
+    # own history and on the batch it runs in: new requests start from the
+    # fixed configured prior and the hysteresis reference is per request, so
+    # an identical request run alone repeats exactly whatever ran before it.
+    _acc_s: dict[str, float] = field(default_factory=dict)
+    _acc_f: dict[str, float] = field(default_factory=dict)
+    _accept_last: dict[str, int] = field(default_factory=dict)
+    # Model-wide observed counts, for the log line only (never read by the
+    # choice).
+    _obs_s: float = 0.0
+    _obs_f: float = 0.0
 
     def __post_init__(self) -> None:
         # Seed the prior so the very first steps behave like fixed k=max
@@ -217,9 +360,85 @@ class AdaptiveKPolicy:
         self._prior_weight = min(self._prior_weight + 1, 10_000)
         self._prior += (sample - self._prior) / self._prior_weight
 
+        if self.config.accept:
+            accepted = min(max(num_accepted, 0), num_draft_tokens)
+            rejected = 1.0 if accepted < num_draft_tokens else 0.0
+            d = self.config.accept_decay
+            self._acc_s[req_id] = d * self._acc_s.get(req_id, 0.0) + accepted
+            self._acc_f[req_id] = d * self._acc_f.get(req_id, 0.0) + rejected
+            gd = 0.999
+            self._obs_s = gd * self._obs_s + accepted
+            self._obs_f = gd * self._obs_f + rejected
+
     def forget(self, req_id: str) -> None:
         self._ema.pop(req_id, None)
         self._pending_padded.pop(req_id, None)
+        self._acc_s.pop(req_id, None)
+        self._acc_f.pop(req_id, None)
+        self._accept_last.pop(req_id, None)
+
+    # ------------------------------------------------- acceptance-aware depth
+
+    def accept_prior(self) -> float:
+        """The fixed per-draft acceptance new requests start from (config,
+        never adapted at run time: a model-wide running mean would make a
+        request's depth depend on the requests before it)."""
+        return self.config.accept_prior
+
+    def observed_acceptance(self) -> float:
+        """Model-wide observed per-draft acceptance (logging only)."""
+        total = self._obs_s + self._obs_f
+        return self._obs_s / total if total else float("nan")
+
+    def accept_rate(self, req_id: str) -> float:
+        """This request's per-draft acceptance, shrunk towards the fixed
+        prior."""
+        a = self.config.accept_strength
+        p0 = self.accept_prior()
+        s = self._acc_s.get(req_id, 0.0)
+        f = self._acc_f.get(req_id, 0.0)
+        return (s + a * p0) / (s + f + a)
+
+    @staticmethod
+    def expected_tokens(p: float, k: int) -> float:
+        """Tokens a step commits at depth k (bonus included) when each draft
+        is accepted with probability p given the earlier ones were."""
+        p = min(max(p, 0.0), 0.999)
+        return (1.0 - p ** (k + 1)) / (1.0 - p)
+
+    def select_by_acceptance(self, req_ids: list[str], cap: int) -> int:
+        """The depth (a captured count, at most ``cap``, the load width) that
+        maximises the batch's expected tokens per unit step cost. Keeps the
+        current depth unless another beats it by the hysteresis margin."""
+        cfg = self.config
+        table = (
+            cfg.accept_costs_multi
+            if len(req_ids) > 1 and cfg.accept_costs_multi
+            else cfg.accept_costs
+        )
+        candidates = [(k, cost) for k, cost in zip(cfg.allowed, table) if k <= cap]
+        if not candidates or not req_ids:
+            return cap
+        rates = [self.accept_rate(r) for r in req_ids]
+        scores = {
+            k: sum(self.expected_tokens(p, k) for p in rates) / cost
+            for k, cost in candidates
+        }
+        best = max(scores, key=lambda k: (scores[k], -k))
+        # Hysteresis against the depth these requests last ran at (only when
+        # they agree on one; a request's own history, never another's).
+        lasts = {self._accept_last.get(r) for r in req_ids}
+        last = lasts.pop() if len(lasts) == 1 else None
+        if (
+            last is not None
+            and last in scores
+            and last != best
+            and scores[best] <= scores[last] * (1.0 + cfg.accept_hysteresis)
+        ):
+            best = last
+        for r in req_ids:
+            self._accept_last[r] = best
+        return best
 
     # ------------------------------------------------------------------ policy
 
@@ -275,12 +494,23 @@ class AdaptiveKPolicy:
             for k, n in sorted(self._k_counts.items())
         )
         mean_k = sum(k * n for k, n in self._k_counts.items()) / total
-        logger.info(
-            "Adaptive SD: %d steps, mean k=%.2f, accepted-draft prior=%.2f, %s",
-            total,
-            mean_k,
-            self._prior,
-            hist,
-        )
+        if self.config.accept:
+            logger.info(
+                "Adaptive SD: %d steps, mean k=%.2f, per-draft acceptance "
+                "observed=%.3f (prior %.2f), %s",
+                total,
+                mean_k,
+                self.observed_acceptance(),
+                self.accept_prior(),
+                hist,
+            )
+        else:
+            logger.info(
+                "Adaptive SD: %d steps, mean k=%.2f, accepted-draft prior=%.2f, %s",
+                total,
+                mean_k,
+                self._prior,
+                hist,
+            )
         self._k_counts.clear()
         self._steps_since_log = 0

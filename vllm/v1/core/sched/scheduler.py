@@ -301,6 +301,30 @@ class Scheduler(SchedulerInterface):
                 self.adaptive_k = AdaptiveKPolicy(
                     speculative_config.adaptive_k_config
                 )
+            if self.adaptive_k is not None and self.adaptive_k.config.load_mode:
+                by_load = self.adaptive_k.config.by_load
+                logger.info_once(
+                    "GLM-5 load-adaptive DFlash depth active "
+                    "(VLLM_GLM5_DFLASH_ADAPTIVE_K): drafts %d per step, "
+                    "verifies %s requests",
+                    self.num_spec_tokens,
+                    ", ".join(
+                        f"{k} at {n}" if n < len(by_load) else f"{k} at >= {n}"
+                        for n, k in enumerate(by_load, start=1)
+                    ),
+                )
+            if self.adaptive_k is not None and self.adaptive_k.config.accept:
+                cfg = self.adaptive_k.config
+                logger.info_once(
+                    "GLM-5 acceptance-aware DFlash depth active "
+                    "(VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT): each step's depth "
+                    "within the load width maximises expected tokens per unit "
+                    "step cost; costs %s for depths %s, hysteresis %.2f",
+                    str(cfg.accept_costs),
+                    str(cfg.allowed),
+                    cfg.accept_hysteresis,
+                )
+            if self.adaptive_k is not None and not self.adaptive_k.config.load_mode:
                 logger.info(
                     "Acceptance-adaptive speculative decoding enabled: "
                     "draft counts %s, ema=%.2f, margin=%.2f, quantile=%.2f",
@@ -675,13 +699,38 @@ class Scheduler(SchedulerInterface):
         running = self.running
         if not running:
             return self.num_spec_tokens, self.num_spec_tokens
-        k_draft = self.adaptive_k.select_k([r.request_id for r in running])
+        config = self.adaptive_k.config
+        if config.load_mode:
+            # Load mode: the width follows every request the server holds,
+            # waiting ones included. The drafter produces its full block (a
+            # DFlash block is one fixed-shape pass), so drafts are never the
+            # limit after the first step -- unless draft_by_load narrows the
+            # block to the width verified next, trading a one-step lag when
+            # load drops for a cheaper drafter under load.
+            num_reqs = (
+                len(running) + len(self.waiting) + len(self.skipped_waiting)
+            )
+            k_want = load_width = config.k_for_load(num_reqs)
+            if config.accept:
+                # Acceptance-aware: within the load width, the depth that
+                # maximises the batch's expected tokens per unit step cost.
+                decoding = [r.request_id for r in running if not r.is_prefill_chunk]
+                if decoding:
+                    k_want = self.adaptive_k.select_by_acceptance(decoding, k_want)
+            forced = self._forced_depth()
+            if forced is not None and forced <= load_width:
+                k_want = forced
+            k_draft = k_want if config.draft_by_load else self.num_spec_tokens
+        else:
+            k_draft = k_want = self.adaptive_k.select_k(
+                [r.request_id for r in running]
+            )
 
         available = min(
             (len(r.spec_token_ids) for r in running if r.spec_token_ids),
             default=k_draft,
         )
-        k_verify = k_draft if available >= k_draft else self.adaptive_k.snap(available)
+        k_verify = k_want if available >= k_want else self.adaptive_k.snap(available)
 
         for request in running:
             if len(request.spec_token_ids) > k_verify:
@@ -692,6 +741,33 @@ class Scheduler(SchedulerInterface):
         self.adaptive_k.record_choice(k_verify)
         self.adaptive_k.maybe_log()
         return k_verify, k_draft
+
+    def _forced_depth(self) -> int | None:
+        """VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE (diagnostics, step-cost
+        calibration): a depth written in that file, re-read every 64 steps,
+        replaces the chosen one while it is a captured depth."""
+        path = getattr(self, "_force_file", None)
+        if path is None:
+            from vllm import envs as _envs
+
+            path = self._force_file = _envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_FORCE_FILE
+            self._force_value = None
+            self._force_countdown = 0
+        if not path:
+            return None
+        self._force_countdown -= 1
+        if self._force_countdown <= 0:
+            self._force_countdown = 64
+            try:
+                with open(path) as f:
+                    value = int(f.read().strip() or 0)
+            except (OSError, ValueError):
+                value = 0
+            assert self.adaptive_k is not None
+            self._force_value = (
+                value if value in self.adaptive_k.config.allowed else None
+            )
+        return self._force_value
 
     def _pp_decode_cap(self) -> int | None:
         """Decode requests this micro-batch may take under PP decode spreading

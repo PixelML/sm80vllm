@@ -519,6 +519,10 @@ class SpeculativeConfig:
       Defaults to every count in ``1..num_speculative_tokens``. Decode CUDA
       graphs are captured for exactly this set.
     - ``log_interval``: emit a chosen-k histogram every N steps (0 = off).
+    - ``by_load``: pick the count from the number of requests in the server
+      instead of from acceptance: entry ``i`` is the count for ``i + 1``
+      requests, the last entry covers every larger number. Replaces
+      ``min``/``max``/``allowed``.
 
     All of this runs on the scheduler's CPU thread; unlike
     ``enable_adaptive_verification`` nothing is trimmed on the device, so it
@@ -1166,6 +1170,8 @@ class SpeculativeConfig:
                 "method `%s` is deprecated and replaced with mtp.", self.method
             )
             self.method = "mtp"
+
+        self._maybe_enable_glm5_load_adaptive_depth()
 
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
@@ -1907,6 +1913,129 @@ class SpeculativeConfig:
         if not self.use_heterogeneous_vocab:
             self.verify_equal_vocab_size_if_draft_model()
         return self
+
+    def _maybe_enable_glm5_load_adaptive_depth(self) -> None:
+        """VLLM_GLM5_DFLASH_ADAPTIVE_K: deeper DFlash drafts when few requests
+        run, the configured depth under load.
+
+        Rewrites the configuration before anything is derived from it: the
+        drafter width becomes the deepest listed depth, and ``adaptive_k``
+        picks each step's verification width from the request count
+        (VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS for 1, 2, ... requests, then the
+        configured ``num_speculative_tokens``). Idempotent: a configuration it
+        already rewrote is left alone.
+        """
+        import vllm.envs as envs
+
+        if not envs.VLLM_GLM5_DFLASH_ADAPTIVE_K:
+            if envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT:
+                logger.warning_once(
+                    "VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT=1 set but off: it "
+                    "needs VLLM_GLM5_DFLASH_ADAPTIVE_K=1."
+                )
+            if envs.VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH:
+                logger.warning_once(
+                    "VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH=1 set but off: it "
+                    "needs VLLM_GLM5_DFLASH_ADAPTIVE_K=1."
+                )
+            return
+        if isinstance(self.adaptive_k, dict) and "by_load" in self.adaptive_k:
+            return
+
+        def closed(reason: str) -> None:
+            logger.warning_once(
+                "VLLM_GLM5_DFLASH_ADAPTIVE_K=1 set but load-adaptive DFlash "
+                "depth is off: %s.",
+                reason,
+            )
+
+        if self.method != "dflash":
+            return closed(f"needs the DFlash drafter (method is {self.method!r})")
+        if self.num_speculative_tokens is None or self.num_speculative_tokens < 1:
+            return closed("num_speculative_tokens is not set")
+        if self.adaptive_k is not None:
+            return closed("adaptive_k is already configured")
+        if self.num_speculative_tokens_per_batch_size is not None:
+            return closed("num_speculative_tokens_per_batch_size is configured")
+        if self.enable_adaptive_verification:
+            return closed("enable_adaptive_verification is on")
+        raw = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS
+        try:
+            depths = [int(x) for x in raw.replace(" ", "").split(",") if x]
+        except ValueError:
+            return closed(f"VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS={raw!r} is not a list")
+        if not depths or min(depths) < 1:
+            return closed(f"VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS={raw!r} is empty or < 1")
+        base = int(self.num_speculative_tokens)
+        if max(depths) <= base:
+            return closed(
+                f"no depth in VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS={raw!r} "
+                f"exceeds num_speculative_tokens={base}"
+            )
+        by_load = depths + [base]
+        self.num_speculative_tokens = max(by_load)
+        self.adaptive_k = {
+            "by_load": by_load,
+            "log_interval": max(envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG, 0),
+        }
+        if envs.VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH:
+            # The drafter checks it can draft per width (greedy DFlash2) and
+            # otherwise keeps its full block; the verified depth is the same.
+            self.adaptive_k["draft_by_load"] = True
+        if envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT:
+            accept = self._glm5_accept_depth_config(by_load)
+            if accept is not None:
+                self.adaptive_k["accept"] = accept
+
+    def _glm5_accept_depth_config(self, by_load: list[int]) -> dict | None:
+        """VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT: relative step costs for every
+        depth from the shallowest to the deepest load width
+        (VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS, and _COSTS_MULTI for steps of two
+        or more requests; else the layout default measured on 4x CMP 170HX:
+        each extra depth costs 8 % of a depth-3 step with tensor parallelism,
+        10.5 % with pipeline parallelism) and the hysteresis."""
+        import vllm.envs as envs
+
+        allowed = list(range(min(by_load), max(by_load) + 1))
+
+        def parse(raw: str) -> list[float] | None:
+            try:
+                return [float(x) for x in raw.replace(" ", "").split(",") if x]
+            except ValueError:
+                return None
+
+        raw = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS
+        costs = parse(raw)
+        if not raw:
+            pp = getattr(self.target_parallel_config, "pipeline_parallel_size", 1)
+            per_depth = 0.105 if (pp or 1) > 1 else 0.08
+            costs = [round(1.0 + per_depth * (k - allowed[0]), 4) for k in allowed]
+        raw_multi = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI
+        costs_multi = parse(raw_multi) if raw_multi else []
+
+        def valid(c) -> bool:
+            return bool(c) and len(c) == len(allowed) and min(c) > 0
+
+        if not valid(costs) or (raw_multi and not valid(costs_multi)):
+            logger.warning_once(
+                "VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT=1 set but off: "
+                "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS=%r / _COSTS_MULTI=%r need one "
+                "positive cost per depth %s.",
+                raw,
+                raw_multi,
+                str(allowed),
+            )
+            return None
+        config = {
+            "costs": costs,
+            "hysteresis": max(0.0, min(envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST, 0.5)),
+        }
+        prior = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR
+        if prior != 0.75:
+            config["prior"] = min(max(prior, 0.01), 0.99)
+        if costs_multi:
+            config["costs_multi"] = costs_multi
+        return config
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (
