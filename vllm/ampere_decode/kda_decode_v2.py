@@ -520,6 +520,10 @@ def kda_decode_v2(qkv, beta, f_a, g_a, w_f, w_g, conv_state, conv_weight,
     assert nseq * H <= _CTR_SLOTS, "arrival counter buffer too small"
     bv, num_warps = _select(nseq, H, D)
     nv = D // bv
+    # Callers pass the spec-state width (num_spec + 1) as the bound; the gate
+    # keeps real sequences within the workspace, so a wider width (wide copy
+    # windows) must not change the tile.
+    max_query_len = min(max_query_len, _WS_T)
     BT = triton.next_power_of_2(max_query_len)
     assert BT <= _WS_T
     ctr, ws = _counter(qkv.device, nseq * H)
