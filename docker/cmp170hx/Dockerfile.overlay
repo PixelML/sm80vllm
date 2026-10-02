@@ -1,0 +1,10 @@
+# Overlay for the copy-drafts build measured in PixelML/club-170hx (2026-10-02).
+# Build context: a checkout of PixelML/sm80vllm at c93c274c86543d513c67243859480aeec46bc951.
+# BASE_IMAGE: the full build of 127c6f0761b2c81d2c0ba7e2d8a5cf71e3247903 (see README.md).
+# c93c274c8 changes only these four Python files relative to 127c6f076.
+ARG BASE_IMAGE=sm80vllm-cmp170hx:127c6f076
+FROM ${BASE_IMAGE}
+COPY tests/v1/spec_decode/test_glm5_copy_drafts.py /opt/vllm-src/tests/v1/spec_decode/test_glm5_copy_drafts.py
+COPY vllm/envs.py /opt/vllm-src/vllm/envs.py
+COPY vllm/v1/worker/gpu/model_runner.py /opt/vllm-src/vllm/v1/worker/gpu/model_runner.py
+COPY vllm/v1/worker/gpu/spec_decode/copy_drafts.py /opt/vllm-src/vllm/v1/worker/gpu/spec_decode/copy_drafts.py
