@@ -227,3 +227,23 @@ def test_is_reasoning_end_full_prompt(
     token_ids = glm45_tokenizer.convert_tokens_to_ids(tokens)
     check_is_reasoning_end = parser.is_reasoning_end(token_ids)
     assert check_is_reasoning_end == is_reasoning_end
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+def test_thinking_off_ignored_when_template_always_thinks(
+    streaming: bool, glm45_tokenizer
+):
+    """GLM-5.3's template has no thinking flag and always opens <think>, so a
+    request's ``enable_thinking: false`` must not turn the reasoning into
+    content."""
+    import copy
+
+    tokenizer = copy.copy(glm45_tokenizer)
+    tokenizer.chat_template = "{{ messages }}<|assistant|><think>"
+    parser: ReasoningParser = ReasoningParserManager.get_reasoning_parser(parser_name)(
+        tokenizer, chat_template_kwargs={"enable_thinking": False}
+    )
+    output = tokenizer.tokenize("Let me think.</think>The answer is 4.")
+    reasoning, content = run_reasoning_extraction(parser, output, streaming=streaming)
+    assert reasoning == "Let me think."
+    assert content == "The answer is 4."

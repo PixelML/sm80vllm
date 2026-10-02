@@ -77,6 +77,21 @@ def _glm47_arg_converter(raw_args: str, partial: bool) -> str:
     return json.dumps(params, ensure_ascii=False)
 
 
+_THINKING_FLAG_RE = re.compile(r"\b(?:enable_)?thinking\b")
+
+
+def template_honors_thinking_flag(tokenizer: TokenizerLike | None) -> bool:
+    """Whether the chat template reads ``thinking`` / ``enable_thinking``.
+
+    GLM-5.3's template ignores both and always opens ``<think>``, so the
+    model reasons whatever the request says; the parser must then start in
+    reasoning too. Unknown templates are assumed to honor the flags."""
+    template = getattr(tokenizer, "chat_template", None)
+    if not isinstance(template, str):
+        return True
+    return _THINKING_FLAG_RE.search(template) is not None
+
+
 @functools.cache
 def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
     arg_tag_transitions = {
@@ -195,6 +210,7 @@ class Glm47MoeParser(ParserEngine):
         self.thinking_enabled = (
             True
             if thinking is None and enable_thinking is None
+            or not template_honors_thinking_flag(tokenizer)
             else bool(thinking) or bool(enable_thinking)
         )
         kwargs.setdefault(
