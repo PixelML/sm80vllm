@@ -1974,6 +1974,17 @@ class SpeculativeConfig:
             )
         by_load = depths + [base]
         self.num_speculative_tokens = max(by_load)
+        wide = envs.VLLM_GLM5_COPY_WIDE if envs.VLLM_GLM5_COPY_DRAFTS else 0
+        if wide > self.num_speculative_tokens:
+            # Room for wide copy windows; DFlash still drafts at most
+            # max(by_load) (see glm5_copy_wide_width).
+            self.num_speculative_tokens = wide
+            logger.info(
+                "GLM-5 copy drafts: steps of copying requests verify %d drafts "
+                "(DFlash depths %s)",
+                wide,
+                sorted(set(by_load)),
+            )
         self.adaptive_k = {
             "by_load": by_load,
             "log_interval": max(envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG, 0),
@@ -2135,7 +2146,28 @@ class SpeculativeConfig:
 
     def adaptive_k_draft_counts(self) -> tuple[int, ...]:
         """Draft counts the scheduler may pick, so graphs can be captured."""
-        return self.adaptive_k_config.allowed if self.adaptive_k_config else ()
+        if not self.adaptive_k_config:
+            return ()
+        wide = self.glm5_copy_wide_width()
+        allowed = tuple(self.adaptive_k_config.allowed)
+        return allowed + (wide,) if wide else allowed
+
+    def glm5_copy_wide_width(self) -> int:
+        """VLLM_GLM5_COPY_WIDE when it is in effect (above every DFlash depth
+        and the configured width), else 0."""
+        import vllm.envs as envs
+
+        wide = envs.VLLM_GLM5_COPY_WIDE if envs.VLLM_GLM5_COPY_DRAFTS else 0
+        config = self.adaptive_k_config
+        if (
+            not wide
+            or config is None
+            or not config.allowed
+            or wide <= max(config.allowed)
+            or self.num_speculative_tokens != wide
+        ):
+            return 0
+        return wide
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

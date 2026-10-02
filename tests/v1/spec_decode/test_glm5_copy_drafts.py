@@ -25,10 +25,15 @@ def reference(tokens: list[int], prompt_len: int, width: int) -> list[int] | Non
     return None
 
 
-def run(rows: list[tuple[list[int], int]], width: int, max_model_len: int = 4096):
+def run(
+    rows: list[tuple[list[int], int]],
+    width: int,
+    max_model_len: int = 4096,
+    wide: int = 0,
+):
     device = torch.device("cuda")
     n = len(rows)
-    cd = CopyDrafts(n + 1, max_model_len, device, MATCH, REPLY_MATCH)
+    cd = CopyDrafts(n + 1, max_model_len, device, MATCH, REPLY_MATCH, wide)
     all_ids = torch.zeros(n + 1, max_model_len, dtype=torch.int32, device=device)
     total = torch.zeros(n + 1, dtype=torch.int32, device=device)
     prompt = torch.zeros(n + 1, dtype=torch.int32, device=device)
@@ -40,9 +45,12 @@ def run(rows: list[tuple[list[int], int]], width: int, max_model_len: int = 4096
         total[slot] = len(toks)
         prompt[slot] = plen
         cd.add_request(slot)
-    drafts = torch.full((n, width), -7, dtype=torch.int64, device=device)
-    cd.apply(drafts, idx, all_ids, total, prompt)
-    return cd, drafts.tolist(), (all_ids, total, prompt, idx)
+    cols = max(width, wide)
+    slots = torch.full((n + 1, cols), -7, dtype=torch.int64, device=device)
+    req_ids = [f"r{b}" for b in range(n)]
+    cd.apply(slots, idx, req_ids, width, all_ids, total, prompt)
+    drafts = [slots[n - b, :width].tolist() for b in range(n)]
+    return cd, drafts, (all_ids, total, prompt, idx, slots)
 
 
 @pytest.mark.parametrize("width", [3, 7])
@@ -82,22 +90,44 @@ def test_latest_prompt_match_and_reply_rule():
 def test_incremental_mirror_and_reset():
     width = 3
     toks = list(range(1, 41)) + list(range(1, 9))
-    cd, drafts, (all_ids, total, prompt, idx) = run([(toks, 40)], width)
+    cd, drafts, (all_ids, total, prompt, idx, d) = run([(toks, 40)], width)
     assert drafts[0] == [9, 10, 11]
     # append accepted tokens: the suffix 4..11 still occurs in the prompt
     slot = int(idx[0])
     all_ids[slot, 48:51] = torch.tensor([9, 10, 11], dtype=torch.int32)
     total[slot] = 51
-    d = torch.full((1, width), -7, dtype=torch.int64, device="cuda")
-    cd.apply(d, idx, all_ids, total, prompt)
-    assert d.tolist()[0] == [12, 13, 14]
+    d.fill_(-7)
+    cd.apply(d, idx, ["r0"], width, all_ids, total, prompt)
+    assert d[slot].tolist() == [12, 13, 14]
     # a new request in the same slot with a shorter history
     all_ids[slot, :12] = torch.tensor([7] * 12, dtype=torch.int32)
     total[slot] = 12
     prompt[slot] = 12
     cd.add_request(slot)
     d.fill_(-7)
-    cd.apply(d, idx, all_ids, total, prompt)
-    assert d.tolist()[0] == [7, 7, 7]
+    cd.apply(d, idx, ["r0"], width, all_ids, total, prompt)
+    assert d[slot].tolist() == [7, 7, 7]
     seen, copied = cd.stats.tolist()
     assert (seen, copied) == (3, 3)
+
+
+def test_wide_copy_and_flags():
+    width, wide = 3, 6
+    head = list(range(100, 108))
+    # source with a long tail (wide) and request 2 with a short tail (narrow)
+    long_src = head + [1, 2, 3, 4, 5, 6, 7] + [9] * 3
+    short_src = [9] * 10 + head + [1, 2, 3, 4]
+    rows = [(long_src + [50] + head, len(long_src)), (short_src + head, len(short_src))]
+    cd, _, (_, total, _, idx, slots) = run(rows, width, wide=wide)
+    assert slots[int(idx[0])].tolist() == [1, 2, 3, 4, 5, 6]
+    # 4 tokens follow the match, then the suffix itself: a 6-token copy fits
+    assert slots[int(idx[1])].tolist()[:width] == [1, 2, 3]
+    torch.cuda.synchronize()
+    flags = cd.take_wide_flags()
+    assert flags == {"r0": True, "r1": True}
+    assert cd.take_wide_flags() is None
+    # the latest match leaves only 3 tokens: a step-width copy, not wide
+    cd, drafts, _ = run([([7] * 12, 12)], width, wide=wide)
+    assert drafts[0] == [7, 7, 7]
+    torch.cuda.synchronize()
+    assert cd.take_wide_flags() == {"r0": False}

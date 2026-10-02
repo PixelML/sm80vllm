@@ -338,6 +338,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.copy_drafts: CopyDrafts | None = None
+        self._copy_draft_cap: int | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -740,13 +741,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             elif self.draft_tail is not None:
                 logger.warning("Copy drafts with a remote draft tail: off")
             else:
+                wide = self.vllm_config.speculative_config.glm5_copy_wide_width()
                 self.copy_drafts = CopyDrafts(
                     self.max_num_reqs,
                     self.max_model_len,
                     self.device,
                     envs.VLLM_GLM5_COPY_MATCH,
                     envs.VLLM_GLM5_COPY_REPLY_MATCH,
+                    wide,
                 )
+                if wide:
+                    # The drafter keeps its own depths; wider steps are copies.
+                    self._copy_draft_cap = max(
+                        self.vllm_config.speculative_config.adaptive_k_config.allowed
+                    )
 
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -2277,6 +2285,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             cudagraph_stats=cudagraph_stats,
         )
+        if self.copy_drafts is not None and self.copy_drafts.wide:
+            model_runner_output.copy_wide_flags = self.copy_drafts.take_wide_flags()
         pending_aux_output = None
         if self.aux_output_connector is not None:
             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
@@ -2348,6 +2358,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.supports_variable_num_steps
             ):
                 propose_kwargs["num_steps"] = num_draft_tokens_to_propose
+            if (
+                self._copy_draft_cap is not None
+                and num_draft_tokens_to_propose > self._copy_draft_cap
+            ):
+                propose_kwargs["num_steps"] = self._copy_draft_cap
             if self.draft_tail is not None and self.draft_tail.remote_step(input_batch):
                 remote_tail = propose_kwargs["remote_tail"] = True
             with use_workspace_lane(self._draft_workspace_lane):
@@ -2367,14 +2382,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     mm_inputs=mm_inputs,
                     **propose_kwargs,
                 )
-            if self.copy_drafts is not None and not remote_tail:
-                self.copy_drafts.apply(
-                    draft_tokens,
-                    input_batch.idx_mapping,
-                    self.req_states.all_token_ids.gpu,
-                    self.req_states.total_len.gpu,
-                    self.req_states.prompt_len.gpu,
-                )
             if remote_tail:
                 # The tail stage roots this step's drafts; they reach the
                 # request state through apply_remote_drafts.
@@ -2390,6 +2397,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.draft_tokens[
                     input_batch.idx_mapping, : draft_tokens.shape[1]
                 ] = draft_tokens
+            if self.copy_drafts is not None and not remote_tail:
+                self.copy_drafts.apply(
+                    self.req_states.draft_tokens,
+                    input_batch.idx_mapping,
+                    input_batch.req_ids,
+                    draft_tokens.shape[1],
+                    self.req_states.all_token_ids.gpu,
+                    self.req_states.total_len.gpu,
+                    self.req_states.prompt_len.gpu,
+                )
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch

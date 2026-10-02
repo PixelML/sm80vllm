@@ -298,6 +298,10 @@ class ModelRunnerOutput:
 
     aux_output_connector_output: dict[str, AuxRequestOutput] | None = None
 
+    # VLLM_GLM5_COPY_WIDE: req_id -> whether the request had a wide copy the
+    # last time the worker could tell (a step or two behind).
+    copy_wide_flags: dict[str, bool] | None = None
+
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
 

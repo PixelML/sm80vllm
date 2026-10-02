@@ -314,9 +314,14 @@ class CudaGraphManager:
             )
             adaptive_k_config = speculative_config.adaptive_k_config
             if getattr(adaptive_k_config, "load_mode", False):
+                wide = speculative_config.glm5_copy_wide_width()
                 decode_max_reqs = {
                     num_spec + num_new_sampled_tokens_per_step: (
-                        adaptive_k_config.max_reqs_for(num_spec, self.max_num_reqs)
+                        self.max_num_reqs
+                        if num_spec == wide
+                        else adaptive_k_config.max_reqs_for(
+                            num_spec, self.max_num_reqs
+                        )
                     )
                     for num_spec in adaptive_k_counts
                 }

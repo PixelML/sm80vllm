@@ -296,10 +296,24 @@ class Scheduler(SchedulerInterface):
         # Draft count the drafter is asked to produce for the next step. It
         # can exceed cur_num_spec_tokens while k is climbing back up.
         self.next_num_spec_tokens = self.num_spec_tokens
+        # VLLM_GLM5_COPY_WIDE: a step whose decoding requests are all copying
+        # (as the worker last reported) verifies this many copied drafts.
+        self.copy_wide = 0
         if speculative_config is not None:
             if speculative_config.uses_adaptive_k():
                 self.adaptive_k = AdaptiveKPolicy(
                     speculative_config.adaptive_k_config
+                )
+                self.copy_wide = speculative_config.glm5_copy_wide_width()
+            if self.copy_wide:
+                # The DFlash depths stay the policy's; only copying steps go wide.
+                self.next_num_spec_tokens = self.cur_num_spec_tokens = max(
+                    self.adaptive_k.config.allowed
+                )
+                logger.info(
+                    "GLM-5 wide copy windows active (VLLM_GLM5_COPY_WIDE): "
+                    "steps of copying requests verify %d drafts",
+                    self.copy_wide,
                 )
             if self.adaptive_k is not None and self.adaptive_k.config.load_mode:
                 by_load = self.adaptive_k.config.by_load
@@ -698,6 +712,9 @@ class Scheduler(SchedulerInterface):
         assert self.adaptive_k is not None
         running = self.running
         if not running:
+            if self.copy_wide:
+                k = max(self.adaptive_k.config.allowed)
+                return k, k
             return self.num_spec_tokens, self.num_spec_tokens
         config = self.adaptive_k.config
         if config.load_mode:
@@ -725,6 +742,13 @@ class Scheduler(SchedulerInterface):
             k_draft = k_want = self.adaptive_k.select_k(
                 [r.request_id for r in running]
             )
+        if self.copy_wide:
+            decoding = [r for r in running if not r.is_prefill_chunk]
+            if decoding and all(
+                getattr(r, "copy_wide", False) and not r.use_structured_output
+                for r in decoding
+            ):
+                k_draft = k_want = self.copy_wide
 
         available = min(
             (len(r.spec_token_ids) for r in running if r.spec_token_ids),
@@ -2321,6 +2345,11 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        if model_runner_output.copy_wide_flags:
+            for req_id, wide in model_runner_output.copy_wide_flags.items():
+                request = self.requests.get(req_id)
+                if request is not None:
+                    request.copy_wide = wide
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -2407,7 +2436,12 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens -= num_rejected
                     if request.num_output_placeholders > 0:
                         request.num_output_placeholders -= num_rejected
-                if self.adaptive_k is not None:
+                if self.adaptive_k is not None and not (
+                    # Wide copy steps say nothing about the drafter's
+                    # acceptance, which picks the DFlash depth.
+                    self.copy_wide
+                    and num_draft_tokens > max(self.adaptive_k.config.allowed)
+                ):
                     # Grammar-invalidated drafts were never really proposed,
                     # so they must not count against the acceptance EMA.
                     num_invalid = (

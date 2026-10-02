@@ -214,6 +214,7 @@ if TYPE_CHECKING:
     VLLM_GLM5_COPY_DRAFTS: bool = False
     VLLM_GLM5_COPY_MATCH: int = 8
     VLLM_GLM5_COPY_REPLY_MATCH: int = 16
+    VLLM_GLM5_COPY_WIDE: int = 0
     VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS: str = "5,4"
     VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG: int = 0
     VLLM_GLM5_DFLASH_ADAPTIVE_DRAFT_WIDTH: bool = False
@@ -1881,6 +1882,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GLM5_COPY_REPLY_MATCH": lambda: int(
         os.getenv("VLLM_GLM5_COPY_REPLY_MATCH", "16")
     ),
+    # With VLLM_GLM5_COPY_DRAFTS and VLLM_GLM5_DFLASH_ADAPTIVE_K: a step whose
+    # requests are all copying verifies this many copied drafts (above the
+    # deepest DFlash depth; DFlash itself keeps its depths). 0: off.
+    "VLLM_GLM5_COPY_WIDE": lambda: int(os.getenv("VLLM_GLM5_COPY_WIDE", "0")),
     "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS": lambda: os.getenv(
         "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS", "5,4"
     ),
