@@ -452,7 +452,17 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     params_dict[name][: narrow.shape[0]].copy_(narrow)
                     loaded_params.add(name)
                     continue
+                # Vision-Exp checkpoint carries vision-language variants and
+                # hash-layer gate biases that the text-only DSpark draft does
+                # not define as parameters. Skip them the same way the target
+                # model loader does.
+                if name.endswith("bias_vl"):
+                    continue
                 if name.endswith(".ffn.gate.bias"):
+                    import re as _re
+                    _m = _re.search(r"layers\.(\d+)\.", name)
+                    if _m and int(_m.group(1)) < self.config.num_hash_layers:
+                        continue
                     name = name.replace(
                         ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"
                     )

@@ -66,6 +66,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
@@ -562,6 +563,12 @@ class DeepseekV4MoE(nn.Module):
 
         self.gate.e_score_correction_bias = None
         self.gate.tid2eid = None
+        self.gate.bias_vl = None
+        # Image tokens borrow five consecutive reserved in-vocab ids starting
+        # at IMAGE_SENTINEL_BASE_ID; 0 disables vision routing (text model).
+        self.image_sentinel_lo = (
+            IMAGE_SENTINEL_BASE_ID if getattr(config, "vision_n_layers", 0) > 0 else 0
+        )
         is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
         if is_hash_moe:
@@ -577,8 +584,21 @@ class DeepseekV4MoE(nn.Module):
                 ),
                 requires_grad=False,
             )
-        elif getattr(config, "topk_method", None) == "noaux_tc":
+        if getattr(config, "topk_method", None) == "noaux_tc" and (
+            not is_hash_moe or getattr(config, "vision_n_layers", 0) > 0
+        ):
+            # Vision checkpoints ship a gate bias on hash layers too (it is
+            # unused for routing there; image tokens use bias_vl instead).
             self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+
+        if getattr(config, "vision_n_layers", 0) > 0:
+            # Vision checkpoints route image sentinel tokens with bias_vl
+            # instead of e_score_correction_bias / the hash table. Created on
+            # every MoE layer, hash layers included.
+            self.gate.bias_vl = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
             )
@@ -689,6 +709,8 @@ class DeepseekV4MoE(nn.Module):
             router_logits_dtype=torch.float32,
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
+            bias_vl=getattr(self.gate, "bias_vl", None),
+            image_sentinel_lo=self.image_sentinel_lo,
         )
 
     def forward(
@@ -696,6 +718,10 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+        # getattr for test doubles that fake the gate module.
+        bias_vl = getattr(self.gate, "bias_vl", None)
+        if bias_vl is not None and input_ids is None:
+            raise ValueError("DeepSeek V4 vision MoE routing requires input_ids.")
 
         if not self.use_mega_moe:
             return self._forward_fused_moe(hidden_states, input_ids)
@@ -1216,6 +1242,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
 
         for name, loaded_weight in weights:
+            # Vision-Exp checkpoints store ffn.gate.bias on hash-MoE layers
+            # too, where routing is vocabulary-hash based and the fork
+            # intentionally registers no e_score_correction_bias parameter.
+            if name.endswith("ffn.gate.e_score_correction_bias"):
+                m = re.search(r"layers\.(\d+)\.", name)
+                if m and int(m.group(1)) < self.config.num_hash_layers:
+                    continue
             if pad_shared_expert and ".shared_experts." in name:
                 loaded_weight = self._pad_shared_expert_weight(
                     self.quant_config, name, loaded_weight
@@ -1507,8 +1540,24 @@ class DeepseekV4ForCausalLM(
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loader = AutoWeightsLoader(self, skip_substrs=["mtp.", "vision.", "aligner.", "image_", "_vl"])
+        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        # Mirror the pinned Vision head (2c8af219) ordering: self-invoke the
+        # post-load finalize step here so it always runs immediately after a
+        # real (non-dummy) weight load, before any forward pass can observe
+        # unfinalized state (e.g. hc_attn_fn_broadcast still None).
+        #
+        # This also matters for the outer VL wrapper
+        # (DeepseekV4ForConditionalGeneration.load_weights, vl_model.py):
+        # it sets `self._weights_finalized = True` right after delegating to
+        # this method, on the assumption that finalization already happened
+        # here. Without this call, that flag was set prematurely, and the
+        # wrapper's own process_weights_after_loading() (the only other
+        # place finalize_mega_moe_weights/finalize_mhc_broadcast_weights
+        # could run) then early-returned and skipped it entirely — so
+        # hc_attn_fn_broadcast was never populated for a real weight load.
+        self.process_weights_after_loading()
+        return loaded_params
 
     def process_weights_after_loading(self) -> None:
         # Model-level post-load hook: runs for every loader, including

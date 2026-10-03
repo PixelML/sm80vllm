@@ -484,8 +484,21 @@ class ModelCudaGraphManager(CudaGraphManager):
                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
             }
             if not self.is_first_pp_rank:
-                # Update for non-first PP ranks.
-                model_inputs["input_ids"] = None
+                # Update for non-first PP ranks. Hidden states arrive via
+                # intermediate_tensors, so embeddings are never needed here.
+                # Raw input_ids are a separate concern: models that set
+                # requires_raw_input_tokens (e.g. DeepSeek V4 Vision's MoE
+                # image-token routing) thread input_ids through every decoder
+                # layer on every PP rank, not just to build the initial
+                # embedding on rank 0. Only null input_ids here when the model
+                # does not need it, mirroring the same exception already
+                # applied in gpu/model_runner.py's non-capture forward path
+                # (model_runner.py's prepare-inputs branch for non-first PP
+                # ranks) -- this file's capture path was missing that gate,
+                # so CUDA-graph warmup crashed those models with "requires
+                # input_ids" instead of matching the real forward path.
+                if not getattr(model, "requires_raw_input_tokens", False):
+                    model_inputs["input_ids"] = None
                 model_inputs["inputs_embeds"] = None
                 assert intermediate_tensors is not None
                 model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]
