@@ -418,7 +418,15 @@ class Glm5NextDecoderLayer(nn.Module):
                 kv_lora_rank=config.kv_lora_rank,
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
-                quant_config=None,  # MLA projections are BF16 in checkpoint
+                # MLA projections are BF16 in checkpoint, except q_b / o_proj in a
+                # compressed-tensors dense-q4 one; its ignore list keeps the rest.
+                quant_config=(
+                    quant_config
+                    if not is_mtp_layer
+                    and quant_config is not None
+                    and quant_config.get_name() == "compressed-tensors"
+                    else None
+                ),
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 skip_rope=config.mla_nope,
@@ -1315,6 +1323,25 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             (".in_proj_qkvbfg_a", ".f_a_proj", 4),
             (".in_proj_qkvbfg_a", ".g_a_proj", 5),
         ]
+        kda_splits = {
+            layer.self_attn.split_in_proj
+            for layer in self.layers
+            if isinstance(layer, Glm5NextDecoderLayer) and layer.layer_kind == "kda"
+        }
+        if len(kda_splits) > 1:
+            raise ValueError("KDA q/k/v must be quantized in all layers or in none")
+        if True in kda_splits:
+            # Dense q4: int4 q/k/v and BF16 b/f_a/g_a load into two GEMMs.
+            stacked_params_mapping = [
+                m for m in stacked_params_mapping if m[0] != ".in_proj_qkvbfg_a"
+            ] + [
+                (".in_proj_qkv", ".q_proj", 0),
+                (".in_proj_qkv", ".k_proj", 1),
+                (".in_proj_qkv", ".v_proj", 2),
+                (".in_proj_bfg_a", ".b_proj", 0),
+                (".in_proj_bfg_a", ".f_a_proj", 1),
+                (".in_proj_bfg_a", ".g_a_proj", 2),
+            ]
         if self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
@@ -1620,6 +1647,14 @@ class Glm5NextForConditionalGeneration(
     # at load for mixed-precision Quark checkpoints.
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "wk_weights_proj": ["wk", "weights_proj"],
+        "in_proj_qkvbfg_a": [
+            *("q_proj", "k_proj", "v_proj"),
+            *("b_proj", "f_a_proj", "g_a_proj"),
+        ],
+        "in_proj_qkv": ["q_proj", "k_proj", "v_proj"],
+        "in_proj_bfg_a": ["b_proj", "f_a_proj", "g_a_proj"],
     }
 
     # NOTE: weight-prefix mapping is inherited from Glm4vForConditionalGeneration
@@ -1868,6 +1903,10 @@ def _try_load_fp8_attn_proj(
     # If the model actually kept this projection in FP8, let the normal path
     # handle it (it has a weight_scale_inv param).
     if target_s in params_dict:
+        return False
+    # A compressed-tensors int4 projection (dense q4) has weight_packed /
+    # weight_scale params and no BF16 weight: its scale is not an FP8 one.
+    if target_w not in params_dict:
         return False
 
     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})
