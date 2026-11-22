@@ -8,6 +8,7 @@ import torch
 
 from vllm.triton_utils import tl, tldevice, triton
 
+from . import LAUNCH_PDL, gdc_wait
 from .block_scales import _scale_offsets
 
 
@@ -51,7 +52,7 @@ def _store_mxfp8_block(
 
 @triton.jit
 def _mxfp8_quantize_kernel(X, Y, S, M, N: tl.constexpr, BLOCK: tl.constexpr):
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     for r in range(tl.program_id(0), M, tl.num_programs(0)):
         row = tl.cast(r, tl.int64)
         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -80,6 +81,6 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         N=n,
         BLOCK=block,
         enable_fp_fusion=False,
-        launch_pdl=True,
+        launch_pdl=LAUNCH_PDL,
     )
     return values, scales

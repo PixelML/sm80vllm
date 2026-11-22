@@ -25,7 +25,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
-from .ops import use_sm100_kernels
+from .ops import is_sm80, use_sm100_kernels
 from .ops.activation import swiglu_quantize
 from .ops.block_scales import shuffle_rows, swizzle_block_scales
 from .ops.moe import NUM_COUNTERS, combine, combine_push, route
@@ -291,7 +291,11 @@ class Inkling2Experts(nn.Module):
             down = self._gemm(activated, "w2", tiles, plan, 1)
         else:
             assert self.humming is not None, "process_weights_after_loading"
-            ids, gammas, src2dst = routing
+            if len(routing) == 4:
+                ids, gammas, src2dst, pre_align8 = routing
+            else:
+                ids, gammas, src2dst = routing
+                pre_align8 = None
             down = self.humming(
                 x,
                 ids,
@@ -300,6 +304,7 @@ class Inkling2Experts(nn.Module):
                 self.num_experts * self.ep_size,
                 self.gate_cap,
                 self.up_cap,
+                pre_align8=pre_align8,
             )
         if push is not None:
             # Each rank's fp32 combine is rounded once to bf16.
@@ -383,6 +388,28 @@ class Inkling2MoE(nn.Module):
         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
             is_padding = get_forward_context().is_padding
         if not (experts.sm100 or experts.sm120):
+            if (
+                is_sm80()
+                and 1 <= x.shape[0] <= 3
+                and is_padding is None
+                and experts.ep_size == 1
+                and experts.num_experts == 128
+                and gate.topk == 8
+                and x.shape[1] == 2304
+            ):
+                from ..sm80_ops_v2 import select_and_align_32cta_128
+
+                (ids, gammas, src2dst), pre_align8 = select_and_align_32cta_128(
+                    x,
+                    gate.weight,
+                    gate.bias,
+                    experts.expert_bounds,
+                    gate.route_scale,
+                    8,
+                )
+                return experts(
+                    x, (ids, gammas, src2dst, pre_align8), None, None, reduce, push
+                )
             selected = select_experts(
                 x,
                 gate.weight,

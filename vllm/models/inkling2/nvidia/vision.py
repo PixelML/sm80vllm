@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.models.inkling2.nvidia.ops import use_sm100_kernels
+from vllm.models.inkling2.nvidia.ops import is_sm80, use_sm100_kernels
 from vllm.models.inkling2.nvidia.ops.linear import linear_k_groups
 from vllm.models.inkling2.nvidia.ops.vision import (
     apply_rotary_qk_,
@@ -91,7 +91,11 @@ class Inkling2VisionAttention(nn.Module):
         else:
             from vllm.vllm_flash_attn import flash_attn_varlen_func
 
-            version = 2 if current_platform.is_device_capability_family(120) else 3
+            version = (
+                2
+                if (current_platform.is_device_capability_family(120) or is_sm80())
+                else 3
+            )
             out = flash_attn_varlen_func(q, k, v, fa_version=version, **kwargs)
         return self.out_proj(out.view(hidden.shape))
 

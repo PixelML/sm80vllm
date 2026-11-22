@@ -16,7 +16,12 @@ holds for every replay of a CUDA graph.
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+_HAS_SM89_FP8_CVT: tl.constexpr = tl.constexpr(
+    current_platform.is_cuda() and current_platform.has_device_capability(89)
+)
 
 # The query tile of tml_fa4 that shears the relative logits.
 _SHEAR_TILE = tl.constexpr(128)
@@ -35,25 +40,64 @@ def _sigmoid(x):
 
 
 @triton.jit
-def _load_fp8_kv(ptr, offsets, mask, dtype: tl.constexpr, D: tl.constexpr):
-    # Load each E4M3 pair once, retaining 16-bit packing for BF16 MMA order.
-    half = tl.arange(0, D // 2)
-    pair = tl.load(
-        ptr.to(tl.pointer_type(tl.uint16))
-        + tl.multiple_of(offsets // 2, D // 2)[:, None]
-        + half[None, :],
-        mask=mask[:, None],
-        other=0,
-    )
-    lo, hi = tl.inline_asm_elementwise(
-        "{ .reg .b32 pair; cvt.rn.f16x2.e4m3x2 pair, $2; mov.b32 {$0, $1}, pair; }",
-        "=h,=h,h",
-        [pair],
-        dtype=(tl.float16, tl.float16),
+def _decode_e4m3fn_u8(u8_val, dtype: tl.constexpr):
+    if _HAS_SM89_FP8_CVT:
+        f16 = tl.inline_asm_elementwise(
+            "cvt.rn.f16x2.e4m3x2 $0, $1;",
+            "=r,h",
+            [u8_val],
+            dtype=tl.float16,
+            is_pure=True,
+            pack=2,
+        )
+        return f16.to(dtype)
+    return tl.inline_asm_elementwise(
+        "{\n"
+        "  .reg .b32 q, s, m;\n"
+        "  cvt.u32.u16 q, $1;\n"
+        "  prmt.b32 q, q, 0, 0x1404;\n"
+        "  and.b32 s, q, 0x80008000;\n"
+        "  shr.u32 m, q, 1;\n"
+        "  and.b32 m, m, 0x3f803f80;\n"
+        "  add.u32 q, m, 0x00800080;\n"
+        "  and.b32 q, q, 0x40004000;\n"
+        "  lop3.b32 m, s, m, q, 0xfe;\n"
+        "  mov.b32 s, 0x5c005c00;\n"
+        "  mul.rn.f16x2 $0, m, s;\n"
+        "}",
+        "=r,h",
+        [u8_val],
+        dtype=tl.float16,
         is_pure=True,
-        pack=1,
-    )
-    return tl.interleave(lo, hi).to(dtype)
+        pack=2,
+    ).to(dtype)
+
+
+@triton.jit
+def _load_fp8_kv(
+    ptr,
+    offsets,
+    mask,
+    dtype: tl.constexpr,
+    D: tl.constexpr,
+    TRANS: tl.constexpr = False,
+):
+    cols = tl.max_contiguous(tl.multiple_of(tl.arange(0, D), D), D)
+    u8_ptr = ptr.to(tl.pointer_type(tl.uint8))
+    offs = tl.multiple_of(offsets, D)
+    if TRANS:
+        raw = tl.load(
+            u8_ptr + offs[None, :] + cols[:, None],
+            mask=mask[None, :],
+            other=0,
+        )
+    else:
+        raw = tl.load(
+            u8_ptr + offs[:, None] + cols[None, :],
+            mask=mask[:, None],
+            other=0,
+        )
+    return _decode_e4m3fn_u8(raw, dtype)
 
 
 @triton.jit
@@ -159,7 +203,7 @@ def _rel_attention_kernel(
             page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
         )
         if K.dtype.element_ty.primitive_bitwidth == 8:
-            k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D).T
+            k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D, TRANS=True)
         else:
             k = tl.load(
                 K + kv_ptrs[None, :] + offs_d[:, None],

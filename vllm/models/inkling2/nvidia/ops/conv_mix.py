@@ -7,6 +7,7 @@ import torch
 
 from vllm.platforms import current_platform
 
+from . import is_sm80
 from .attn_res import attn_res
 from .sconv import short_conv
 from .seq_parallel import SeqParallel
@@ -89,9 +90,35 @@ def conv_mix(
     )
     if sp is None:
         assert halo == 0 and positions.shape[0] == num_tokens and x.dim() == 2
-        if current_platform.is_device_capability_family(120):
+        if current_platform.is_device_capability_family(120) or is_sm80():
             # Native conv/mix kernels require Hopper or SM10x. Keep the
-            # loop executor's cache writes and residual rounding on SM12x.
+            # loop executor's cache writes and residual rounding on SM12x/SM8x.
+            if is_sm80():
+                from ...sm80_ops_v2 import conv_mix_2304
+
+                fused_sm80 = conv_mix_2304(
+                    x,
+                    conv_weight,
+                    cache,
+                    positions,
+                    block_table,
+                    seq_idx,
+                    slot_mapping,
+                    query_start,
+                    stream_offset,
+                    stream_width,
+                    conv_out,
+                    residual,
+                    addend,
+                    stack,
+                    last,
+                    queries,
+                    norm_weight,
+                    norm_eps,
+                    eps,
+                )
+                if fused_sm80 is not None:
+                    return fused_sm80
             short_conv(
                 x,
                 conv_weight,

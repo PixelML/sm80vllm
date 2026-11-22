@@ -25,7 +25,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.inkling.nvidia.ops.fa4_rel_attention import bucket_max_seqlen_q
-from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
+from vllm.models.inkling.nvidia.sconv_swa_attn import (
+    InklingConvState,
+    InklingSconvMetadataBuilder,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
@@ -50,7 +53,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
 
 from ..configs import Inkling2ModelConfig
 from .lora import add_linear_lora
-from .ops import use_sm100_kernels
+from .ops import is_sm80, use_sm100_kernels
 from .ops.attention import (
     _INKLING2_FA4_REL_ATTENTION_KERNEL,
     gate_sink,
@@ -60,9 +63,21 @@ from .ops.attention import (
 )
 from .ops.attention_sm90 import MODE_OUT_LSE, rel_attention
 from .ops.linear import linear
+from .ops.ll_gemm_sm80 import sm80_qkv_bmm, use_sm80_qkv_bmm
 from .ops.ll_gemm_sm120 import qkv_bmm, use_qkv_bmm
 from .ops.sconv import attention_prologue, shift_rel_proj
 from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
+
+_orig_sconv_varlen_max_q = (
+    InklingSconvMetadataBuilder.get_varlen_cudagraph_max_query_len.__func__
+)
+InklingSconvMetadataBuilder.get_varlen_cudagraph_max_query_len = classmethod(  # type: ignore[method-assign]
+    lambda cls, vllm_config, kv_cache_spec: (
+        262144
+        if is_sm80()
+        else _orig_sconv_varlen_max_q(cls, vllm_config, kv_cache_spec)
+    )
+)
 
 
 @dataclass
@@ -79,6 +94,14 @@ class Inkling2AttentionMetadataBuilder(FlashAttentionMetadataBuilder):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+    @classmethod
+    def get_varlen_cudagraph_max_query_len(
+        cls, vllm_config: VllmConfig, kv_cache_spec: AttentionSpec
+    ) -> int | None:
+        if is_sm80():
+            return 21
+        return super().get_varlen_cudagraph_max_query_len(vllm_config, kv_cache_spec)
 
     def build(
         self,
@@ -294,6 +317,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         supported: tuple[str, ...] = ("auto", "bfloat16")
         if current_platform.is_device_capability_family(120):
             supported += ("float16", "fp8", "fp8_e4m3")
+        elif is_sm80():
+            supported += ("fp8", "fp8_e4m3")
         if cache_dtype not in supported:
             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
@@ -347,6 +372,13 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             add_linear_lora(self.qkvr, splits[4], x_k, [4])
             add_linear_lora(self.qkvr, splits[5], x_v, [5])
             return list(splits[:6])
+        if use_sm80_qkv_bmm(x_q, x_k, x_v, weight):
+            projected = sm80_qkv_bmm(x_q, x_k, x_v, weight, q_side, k_end)
+            splits = projected.split(self.split_sizes, dim=-1)
+            add_linear_lora(self.qkvr, projected, x_q, range(4))
+            add_linear_lora(self.qkvr, splits[4], x_k, [4])
+            add_linear_lora(self.qkvr, splits[5], x_v, [5])
+            return list(splits[:6])
         projected = linear(x_q, weight[: sum(self.q_side_splits)])
         k = linear(x_k, weight[q_side:k_end])
         v = linear(x_v, weight[k_end : k_end + kv_size])
@@ -360,7 +392,12 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.fp8_kv:
             # Every loop pass owns byte storage containing unit-scale E4M3 KV.
-            kv_cache = kv_cache.view(torch.float8_e4m3fn)
+            # Keep uint8 on pre-SM89 (SM80) so Triton never rejects fp8e4nv args.
+            kv_cache = kv_cache.view(
+                torch.float8_e4m3fn
+                if current_platform.has_device_capability(89)
+                else torch.uint8
+            )
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
         return (
             canonicalize_singleton_dim_strides(key_cache),
@@ -388,7 +425,11 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             x_k = x_v = x_q
         assert x_k is not None and x_v is not None
         q, r, gate, sinks, k, v = self._project(x_q, x_k, x_v)
-        output = torch.empty(gate.shape, dtype=q.dtype, device=q.device)
+        output = (
+            torch.zeros(gate.shape, dtype=q.dtype, device=q.device)
+            if (is_sm80() and q.shape[0] <= 512)
+            else torch.empty(gate.shape, dtype=q.dtype, device=q.device)
+        )
         self._attention(
             positions,
             q,
