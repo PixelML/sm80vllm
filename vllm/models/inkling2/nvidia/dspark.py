@@ -216,6 +216,13 @@ class Inkling2DraftSelfAttention(nn.Module):
         self.window = config.sliding_window_size + self.block if is_local else 0
         vllm_config = get_current_vllm_config()
         self.fp8_kv = vllm_config.cache_config.cache_dtype in ("fp8", "fp8_e4m3")
+        if is_sm80() and self.fp8_kv:
+            from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+
+            self.attn.kv_cache_dtype = vllm_config.cache_config.cache_dtype
+            self.attn.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+                vllm_config.cache_config.cache_dtype, vllm_config.model_config
+            )
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.register_buffer(
             "cu_seqlens_q",

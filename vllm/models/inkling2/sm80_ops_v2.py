@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native SM80 CUDA megakernels wrapper (ctypes -> libsm80_fast_v5.so)."""
+"""Native SM80 CUDA megakernels wrapper (ctypes -> libsm80_fast_v6.so / v5.so)."""
 
 import ctypes
 import fcntl
@@ -15,11 +15,16 @@ import torch
 _LIB: ctypes.CDLL | None = None
 _ALIGN_WS: dict[int, torch.Tensor] = {}
 _SA32_WS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_SWL64_WS: dict[
+    int,
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
 _MFGC_WS: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _MFGEC_WS: dict[
     int,
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ] = {}
+_BLEND9_WS: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 
 def _resolve_so_path() -> str:
@@ -32,18 +37,18 @@ def _resolve_so_path() -> str:
         )
 
     here = os.path.dirname(os.path.abspath(__file__))
-    for so_name in ("libsm80_fast_v5.so", "libsm80_fast_v4.so"):
+    for so_name in ("libsm80_fast_v6.so", "libsm80_fast_v5.so", "libsm80_fast_v4.so"):
         prebuilt_so = os.path.join(here, so_name)
         if os.path.isfile(prebuilt_so):
             return prebuilt_so
 
-    for cu_stem in ("sm80_fast_v5", "sm80_fast_v4"):
+    for cu_stem in ("sm80_fast_v6", "sm80_fast_v5", "sm80_fast_v4"):
         cu_path = os.path.join(here, f"{cu_stem}.cu")
         if os.path.isfile(cu_path):
             break
     else:
         raise FileNotFoundError(
-            f"Missing CUDA source file (sm80_fast_v5.cu) in {here}"
+            f"Missing CUDA source file (sm80_fast_v6.cu / sm80_fast_v5.cu) in {here}"
         )
 
     with open(cu_path, "rb") as fp:
@@ -73,7 +78,7 @@ def _resolve_so_path() -> str:
                 raise RuntimeError(
                     f"Cannot compile {cu_path}: nvcc not found (checked $CUDACXX, "
                     "PATH, and /usr/local/cuda/bin/nvcc), and no prebuilt "
-                    "libsm80_fast_v5.so or $VLLM_SM80_FAST_SO was provided."
+                    "libsm80_fast_v6.so or $VLLM_SM80_FAST_SO was provided."
                 )
 
             fd, tmp_so = tempfile.mkstemp(
@@ -125,72 +130,30 @@ def _get_lib() -> ctypes.CDLL:
         i64 = ctypes.c_int64
         f32 = ctypes.c_float
 
-        lib.launch_moe_align_v3_sm80.argtypes = [
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            vp,
-        ]
+        lib.launch_moe_align_v3_sm80.argtypes = [vp] * 5 + [i32] * 6 + [vp]
         lib.launch_moe_align_v3_sm80.restype = None
 
-        lib.launch_select_and_align_32cta_128_sm80.argtypes = [
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            i32,
-            i32,
-            i32,
-            i32,
-            f32,
-            vp,
-        ]
+        lib.launch_select_and_align_32cta_128_sm80.argtypes = (
+            [vp] * 13 + [i32] * 4 + [f32, vp]
+        )
         lib.launch_select_and_align_32cta_128_sm80.restype = None
 
-        lib.launch_select_and_align_128_sm80.argtypes = [
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            i32,
-            i32,
-            i32,
-            vp,
-            vp,
-            vp,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            f32,
-            i32,
-            vp,
-        ]
+        lib.launch_select_and_align_128_sm80.argtypes = (
+            [vp] * 10 + [i32] * 3 + [vp] * 3 + [i32] * 5 + [f32, i32, vp]
+        )
         lib.launch_select_and_align_128_sm80.restype = None
+
+        if hasattr(lib, "launch_select_partials_and_align_128_sm80"):
+            lib.launch_select_partials_and_align_128_sm80.argtypes = (
+                [vp] * 10 + [i32] * 5 + [f32, vp]
+            )
+            lib.launch_select_partials_and_align_128_sm80.restype = None
+
+        if hasattr(lib, "launch_fused_up_blend_rms_2304_sm80"):
+            lib.launch_fused_up_blend_rms_2304_sm80.argtypes = (
+                [vp] * 6 + [i64, i64, i32, i32, f32, vp]
+            )
+            lib.launch_fused_up_blend_rms_2304_sm80.restype = None
 
         lib.launch_swiglu_1152_sm80.argtypes = [vp, vp, vp, vp, i32, vp]
         lib.launch_swiglu_1152_sm80.restype = None
@@ -198,61 +161,21 @@ def _get_lib() -> ctypes.CDLL:
         lib.launch_combine_2304_bf16_sm80.argtypes = [vp, vp, vp, i32, vp]
         lib.launch_combine_2304_bf16_sm80.restype = None
 
-        lib.launch_attn_res_2304_sm80.argtypes = [
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            i64,
-            i64,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            f32,
-            f32,
-            vp,
-        ]
+        lib.launch_attn_res_2304_sm80.argtypes = (
+            [vp] * 6 + [i64, i64] + [i32] * 5 + [f32, f32, vp]
+        )
         lib.launch_attn_res_2304_sm80.restype = i32
 
-        lib.launch_conv_mix_2304_sm80.argtypes = [
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            i64,
-            i64,
-            i64,
-            i32,
-            i32,
-            i32,
-            i32,
-            i32,
-            f32,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            i64,
-            i64,
-            i32,
-            i32,
-            i32,
-            f32,
-            f32,
-            vp,
-        ]
+        lib.launch_conv_mix_2304_sm80.argtypes = (
+            [vp] * 8
+            + [i64, i64, i64]
+            + [i32] * 5
+            + [f32]
+            + [vp] * 8
+            + [i64, i64]
+            + [i32] * 3
+            + [f32, f32, vp]
+        )
         lib.launch_conv_mix_2304_sm80.restype = i32
 
         lib.launch_pair_rms_norm_2304_sm80.argtypes = [
@@ -267,45 +190,15 @@ def _get_lib() -> ctypes.CDLL:
         ]
         lib.launch_pair_rms_norm_2304_sm80.restype = None
 
-        lib.launch_blend_rms_norm_2304_sm80.argtypes = [
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            i64,
-            i64,
-            i64,
-            i64,
-            f32,
-            vp,
-        ]
+        lib.launch_blend_rms_norm_2304_sm80.argtypes = (
+            [vp] * 5 + [i64] * 4 + [f32, vp]
+        )
         lib.launch_blend_rms_norm_2304_sm80.restype = None
 
-        lib.launch_markov_rnn_gate_256_sm80.argtypes = [
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            i32,
-            i32,
-            vp,
-        ]
+        lib.launch_markov_rnn_gate_256_sm80.argtypes = [vp] * 7 + [i32, i32, vp]
         lib.launch_markov_rnn_gate_256_sm80.restype = None
 
-        lib.launch_markov_fold_softcap_r1_sm80.argtypes = [
-            vp,
-            vp,
-            vp,
-            vp,
-            vp,
-            i32,
-            f32,
-            vp,
-        ]
+        lib.launch_markov_fold_softcap_r1_sm80.argtypes = [vp] * 5 + [i32, f32, vp]
         lib.launch_markov_fold_softcap_r1_sm80.restype = None
 
         lib.launch_markov_fold_gumbel_cache_r1_sm80.argtypes = (
@@ -323,6 +216,56 @@ def _get_lib() -> ctypes.CDLL:
             u64 = ctypes.c_uint64
             lib.set_l2_persisting_window_sm80.argtypes = [vp, u64, u64, f32, vp]
             lib.set_l2_persisting_window_sm80.restype = i32
+
+        # Round-5 v6 kernels
+        if hasattr(lib, "launch_select_and_worklist_64cta_128_sm80"):
+            lib.launch_select_and_worklist_64cta_128_sm80.argtypes = (
+                [vp] * 16 + [i32] * 4 + [f32, vp]
+            )
+            lib.launch_select_and_worklist_64cta_128_sm80.restype = None
+
+        if hasattr(lib, "launch_sm80_moe_w13_swiglu"):
+            lib.launch_sm80_moe_w13_swiglu.argtypes = [vp] * 9 + [i32, i32, vp]
+            lib.launch_sm80_moe_w13_swiglu.restype = None
+
+        if hasattr(lib, "launch_sm80_moe_w2"):
+            lib.launch_sm80_moe_w2.argtypes = [vp] * 8 + [i32, i32, vp]
+            lib.launch_sm80_moe_w2.restype = None
+
+        if hasattr(lib, "launch_markov_rnn_gate_256_suf_sm80"):
+            lib.launch_markov_rnn_gate_256_suf_sm80.argtypes = (
+                [vp] * 8 + [i32, i32, vp]
+            )
+            lib.launch_markov_rnn_gate_256_suf_sm80.restype = None
+
+        if hasattr(lib, "launch_markov_fold_gumbel_cache_r1_suf_sm80"):
+            lib.launch_markov_fold_gumbel_cache_r1_suf_sm80.argtypes = (
+                [vp] * 18 + [i64, i64, i32, i32, f32, vp]
+            )
+            lib.launch_markov_fold_gumbel_cache_r1_suf_sm80.restype = None
+
+        if hasattr(lib, "launch_suffix_cleanup_prev_sm80"):
+            lib.launch_suffix_cleanup_prev_sm80.argtypes = (
+                [vp] * 6 + [i64, i64, i32, i32, vp]
+            )
+            lib.launch_suffix_cleanup_prev_sm80.restype = None
+
+        if hasattr(lib, "launch_suffix_apply_pointmass_sm80"):
+            lib.launch_suffix_apply_pointmass_sm80.argtypes = (
+                [vp] * 11 + [i64, i64] + [i32] * 5 + [vp]
+            )
+            lib.launch_suffix_apply_pointmass_sm80.restype = None
+
+        if hasattr(lib, "launch_sm80_loop_down_64"):
+            lib.launch_sm80_loop_down_64.argtypes = [vp, vp, vp, i64, i32, i32, vp]
+            lib.launch_sm80_loop_down_64.restype = None
+
+        if hasattr(lib, "launch_fused_up_blend_9tile_2304_sm80"):
+            lib.launch_fused_up_blend_9tile_2304_sm80.argtypes = (
+                [vp] * 9 + [i64, i64, i64, i32, i32, f32, vp]
+            )
+            lib.launch_fused_up_blend_9tile_2304_sm80.restype = None
+
         _LIB = lib
     return _LIB
 
@@ -333,6 +276,28 @@ def _stream(dev: torch.device) -> int:
 
 def _ptr(t: torch.Tensor | None) -> int:
     return 0 if t is None else t.data_ptr()
+
+
+def has_sm80_router_64cta() -> bool:
+    return hasattr(_get_lib(), "launch_select_and_worklist_64cta_128_sm80")
+
+
+def has_sm80_moe_v6() -> bool:
+    lib = _get_lib()
+    return hasattr(lib, "launch_sm80_moe_w13_swiglu") and hasattr(
+        lib, "launch_select_and_worklist_64cta_128_sm80"
+    )
+
+
+def has_sm80_loop_blend_v6() -> bool:
+    lib = _get_lib()
+    return hasattr(lib, "launch_sm80_loop_down_64") and hasattr(
+        lib, "launch_fused_up_blend_9tile_2304_sm80"
+    )
+
+
+def has_sm80_suffix_pointmass() -> bool:
+    return hasattr(_get_lib(), "launch_suffix_apply_pointmass_sm80")
 
 
 def moe_align_block_size(
@@ -409,8 +374,6 @@ def select_and_align_128(
     num_local_experts: int,
     block_sizes: tuple[int, ...],
 ):
-    """Fused select_experts + 1 or 2 moe_align_block_size calls for T <= 256,
-    E=128, topk=8."""
     dev = partials.device
     groups, tokens, experts = partials.shape
     assert experts == 128 and tokens <= 256 and groups in (1, 3)
@@ -467,6 +430,186 @@ def select_and_align_128(
     if bm2 > 0:
         aligns[bm2] = (s2, e2, p2)
     return ids, weights, src2dst, aligns
+
+
+def select_partials_and_align_128(
+    partials: torch.Tensor,
+    bias: torch.Tensor,
+    expert_bounds: torch.Tensor,
+    is_padding: torch.Tensor | None,
+    route_scale: float,
+    block_size: int = 8,
+):
+    dev = partials.device
+    groups, t, _ = partials.shape
+    n = t * 8
+    max_pad = n + 128 * (block_size - 1)
+    n_blocks = (max_pad + block_size - 1) // block_size
+    ids = torch.empty((t, 8), dtype=torch.int32, device=dev)
+    weights = torch.empty((n,), dtype=torch.float32, device=dev)
+    src2dst = torch.empty((n,), dtype=torch.int32, device=dev)
+    sorted_ids = torch.empty((max_pad,), dtype=torch.int32, device=dev)
+    expert_ids = torch.empty((n_blocks,), dtype=torch.int32, device=dev)
+    num_post_pad = torch.empty((1,), dtype=torch.int32, device=dev)
+    _get_lib().launch_select_partials_and_align_128_sm80(
+        partials.data_ptr(),
+        bias.data_ptr(),
+        expert_bounds.data_ptr(),
+        _ptr(is_padding),
+        ids.data_ptr(),
+        weights.data_ptr(),
+        src2dst.data_ptr(),
+        sorted_ids.data_ptr(),
+        expert_ids.data_ptr(),
+        num_post_pad.data_ptr(),
+        t,
+        groups,
+        block_size,
+        max_pad,
+        n_blocks,
+        route_scale,
+        _stream(dev),
+    )
+    return (ids, weights, src2dst), (sorted_ids, expert_ids, num_post_pad)
+
+
+def select_and_worklist_64cta_128(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+    bias: torch.Tensor,
+    expert_bounds: torch.Tensor,
+    route_scale: float,
+    block_size: int = 8,
+    is_padding: torch.Tensor | None = None,
+    with_align: bool = False,
+    with_worklist: bool = True,
+):
+    t = x.shape[0]
+    n = t * 8
+    dev = x.device
+    idx = dev.index or 0
+    bufs = _SWL64_WS.get(idx)
+    if bufs is None:
+        bufs = (
+            torch.empty((16 * 128,), dtype=torch.float32, device=dev),
+            torch.zeros((1,), dtype=torch.int32, device=dev),
+            torch.empty((1,), dtype=torch.int32, device=dev),
+            torch.empty((64,), dtype=torch.int32, device=dev),
+            torch.empty((64 * 8,), dtype=torch.int32, device=dev),
+        )
+        _SWL64_WS[idx] = bufs
+    ws_lg, ctr, num_active, active_experts, active_slots = bufs
+
+    ids = torch.empty((t, 8), dtype=torch.int32, device=dev)
+    weights = torch.empty((n,), dtype=torch.float32, device=dev)
+    src2dst = torch.empty((n,), dtype=torch.int32, device=dev)
+
+    if with_align:
+        max_pad = (
+            min(n * block_size, n + 128 * (block_size - 1))
+            if n < 128
+            else n + 128 * (block_size - 1)
+        )
+        n_blocks = (max_pad + block_size - 1) // block_size
+        sorted_ids = torch.empty((max_pad,), dtype=torch.int32, device=dev)
+        expert_ids = torch.empty((n_blocks,), dtype=torch.int32, device=dev)
+        num_post_pad = torch.empty((1,), dtype=torch.int32, device=dev)
+        s_ptr, e_ptr, p_ptr = (
+            sorted_ids.data_ptr(),
+            expert_ids.data_ptr(),
+            num_post_pad.data_ptr(),
+        )
+        pre_align8 = (sorted_ids, expert_ids, num_post_pad)
+    else:
+        max_pad = 0
+        n_blocks = 0
+        s_ptr = e_ptr = p_ptr = 0
+        pre_align8 = None
+
+    assert 1 <= t <= 16
+    if with_worklist:
+        assert t <= 8
+        na_ptr = num_active.data_ptr()
+        ae_ptr = active_experts.data_ptr()
+        as_ptr = active_slots.data_ptr()
+        worklist = (num_active, active_experts, active_slots)
+    else:
+        na_ptr = ae_ptr = as_ptr = 0
+        worklist = None
+
+    _get_lib().launch_select_and_worklist_64cta_128_sm80(
+        x.data_ptr(),
+        gate_weight.data_ptr(),
+        bias.data_ptr(),
+        expert_bounds.data_ptr(),
+        _ptr(is_padding),
+        ws_lg.data_ptr(),
+        ctr.data_ptr(),
+        ids.data_ptr(),
+        weights.data_ptr(),
+        src2dst.data_ptr(),
+        s_ptr,
+        e_ptr,
+        p_ptr,
+        na_ptr,
+        ae_ptr,
+        as_ptr,
+        t,
+        block_size,
+        max_pad,
+        n_blocks,
+        route_scale,
+        _stream(dev),
+    )
+    return (ids, weights, src2dst), pre_align8, worklist
+
+
+def sm80_moe_forward_v6(
+    x: torch.Tensor,
+    w13_tensors: dict[str, torch.Tensor],
+    w2_tensors: dict[str, torch.Tensor],
+    is_nvfp4: bool,
+    route_weights: torch.Tensor,
+    worklist: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    num_ctas_w13: int = 222,
+    num_ctas_w2: int = 222,
+) -> torch.Tensor:
+    dev = x.device
+    rows = route_weights.numel()
+    num_active, active_experts, active_slots = worklist
+    act = torch.empty((rows, 1152), dtype=torch.bfloat16, device=dev)
+    down = torch.empty((rows, 2304), dtype=torch.bfloat16, device=dev)
+    lib = _get_lib()
+    st = _stream(dev)
+    nv = 1 if is_nvfp4 else 0
+    lib.launch_sm80_moe_w13_swiglu(
+        x.data_ptr(),
+        w13_tensors["weight"].data_ptr(),
+        w13_tensors["weight_scale"].data_ptr(),
+        _ptr(w13_tensors.get("weight_scale_2")),
+        num_active.data_ptr(),
+        active_experts.data_ptr(),
+        active_slots.data_ptr(),
+        route_weights.data_ptr(),
+        act.data_ptr(),
+        nv,
+        num_ctas_w13,
+        st,
+    )
+    lib.launch_sm80_moe_w2(
+        act.data_ptr(),
+        w2_tensors["weight"].data_ptr(),
+        w2_tensors["weight_scale"].data_ptr(),
+        _ptr(w2_tensors.get("weight_scale_2")),
+        num_active.data_ptr(),
+        active_experts.data_ptr(),
+        active_slots.data_ptr(),
+        down.data_ptr(),
+        nv,
+        num_ctas_w2,
+        st,
+    )
+    return down
 
 
 def swiglu_1152(
@@ -656,17 +799,191 @@ def blend_rms_norm_2304(
     return out
 
 
+def sm80_loop_down_64(pair: torch.Tensor, down: torch.Tensor) -> torch.Tensor:
+    s, t, _ = pair.shape
+    out = pair.new_empty((s, t, 64), dtype=torch.bfloat16)
+    _get_lib().launch_sm80_loop_down_64(
+        pair.data_ptr(),
+        down.data_ptr(),
+        out.data_ptr(),
+        down.stride(0),
+        s,
+        t,
+        _stream(pair.device),
+    )
+    return out
+
+
+def fused_up_blend_9tile_2304(
+    dest: torch.Tensor,
+    message: torch.Tensor,
+    hidden: torch.Tensor,
+    gf_t: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+) -> torch.Tensor:
+    s, t, d = message.shape
+    assert s * t <= 24 and d == 2304
+    dev = message.device
+    idx = dev.index or 0
+    ws = _BLEND9_WS.get(idx)
+    if ws is None:
+        ws = (
+            torch.empty((24 * 2304,), dtype=torch.float32, device=dev),
+            torch.empty((24 * 9,), dtype=torch.float32, device=dev),
+            torch.zeros((24,), dtype=torch.int32, device=dev),
+        )
+        _BLEND9_WS[idx] = ws
+    ws_x, ws_sq, ctrs = ws
+    out = message.new_empty((s, t, d), dtype=torch.bfloat16)
+    _get_lib().launch_fused_up_blend_9tile_2304_sm80(
+        dest.data_ptr(),
+        message.data_ptr(),
+        hidden.data_ptr(),
+        gf_t.data_ptr(),
+        norm_weight.data_ptr(),
+        ws_x.data_ptr(),
+        ws_sq.data_ptr(),
+        ctrs.data_ptr(),
+        out.data_ptr(),
+        dest.stride(0),
+        gf_t.stride(0),
+        norm_weight.stride(0),
+        s,
+        t,
+        norm_eps,
+        _stream(dev),
+    )
+    return out
+
+
+def fused_up_blend_rms_2304(
+    dest: torch.Tensor,
+    message: torch.Tensor,
+    hidden: torch.Tensor,
+    gf_t: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+) -> torch.Tensor:
+    s, t, d = message.shape
+    out = message.new_empty((s, t, d), dtype=torch.bfloat16)
+    _get_lib().launch_fused_up_blend_rms_2304_sm80(
+        dest.data_ptr(),
+        message.data_ptr(),
+        hidden.data_ptr(),
+        gf_t.data_ptr(),
+        norm_weight.data_ptr(),
+        out.data_ptr(),
+        dest.stride(0),
+        norm_weight.stride(0),
+        s,
+        t,
+        norm_eps,
+        _stream(message.device),
+    )
+    return out
+
+
+def suffix_cleanup_prev(
+    logits_cache: torch.Tensor | None,
+    idx_mapping: torch.Tensor,
+    row_mapping: torch.Tensor | None,
+    prev_suffix_tok: torch.Tensor,
+    keep_dirty: torch.Tensor | None,
+    just_scrubbed_all: torch.Tensor | None,
+    num_reqs: int,
+    max_spec: int,
+) -> None:
+    if logits_cache is None or num_reqs <= 0:
+        return
+    _get_lib().launch_suffix_cleanup_prev_sm80(
+        logits_cache.data_ptr(),
+        idx_mapping.data_ptr(),
+        _ptr(row_mapping),
+        prev_suffix_tok.data_ptr(),
+        _ptr(keep_dirty),
+        _ptr(just_scrubbed_all),
+        logits_cache.stride(0),
+        logits_cache.stride(1),
+        num_reqs,
+        max_spec,
+        _stream(logits_cache.device),
+    )
+
+
+def suffix_apply_pointmass(
+    logits_cache: torch.Tensor | None,
+    keep_ids: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    row_mapping: torch.Tensor | None,
+    suffix_drafts: torch.Tensor,
+    suffix_num_valid: torch.Tensor,
+    suffix_match_len: torch.Tensor,
+    prev_suffix_tok: torch.Tensor,
+    keep_dirty: torch.Tensor | None,
+    just_scrubbed_all: torch.Tensor | None,
+    out_draft_tokens: torch.Tensor,
+    num_reqs: int,
+    n_spec: int,
+    max_spec: int,
+    min_match_len: int,
+) -> None:
+    if num_reqs <= 0 or n_spec <= 0:
+        return
+    dev = out_draft_tokens.device
+    s0 = 0 if logits_cache is None else logits_cache.stride(0)
+    s1 = 0 if logits_cache is None else logits_cache.stride(1)
+    _get_lib().launch_suffix_apply_pointmass_sm80(
+        _ptr(logits_cache),
+        keep_ids.data_ptr(),
+        idx_mapping.data_ptr(),
+        _ptr(row_mapping),
+        suffix_drafts.data_ptr(),
+        suffix_num_valid.data_ptr(),
+        suffix_match_len.data_ptr(),
+        prev_suffix_tok.data_ptr(),
+        _ptr(keep_dirty),
+        _ptr(just_scrubbed_all),
+        out_draft_tokens.data_ptr(),
+        s0,
+        s1,
+        num_reqs,
+        int(keep_ids.shape[0]),
+        n_spec,
+        max_spec,
+        min_match_len,
+        _stream(dev),
+    )
+
+
 def markov_rnn_gate_256(
     state: torch.Tensor,
     prev_tokens: torch.Tensor,
     markov_w1_weight: torch.Tensor,
     context: torch.Tensor,
     rnn_w_step: torch.Tensor,
+    skip_flag: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = state.shape[0]
     state_out = torch.empty_like(state)
     latent_out = torch.empty_like(state)
-    _get_lib().launch_markov_rnn_gate_256_sm80(
+    lib = _get_lib()
+    if skip_flag is not None and hasattr(lib, "launch_markov_rnn_gate_256_suf_sm80"):
+        lib.launch_markov_rnn_gate_256_suf_sm80(
+            state.data_ptr(),
+            prev_tokens.data_ptr(),
+            markov_w1_weight.data_ptr(),
+            context.data_ptr(),
+            rnn_w_step.data_ptr(),
+            skip_flag.data_ptr(),
+            state_out.data_ptr(),
+            latent_out.data_ptr(),
+            num_reqs,
+            1 if prev_tokens.dtype == torch.int64 else 0,
+            _stream(state.device),
+        )
+        return state_out, latent_out
+    lib.launch_markov_rnn_gate_256_sm80(
         state.data_ptr(),
         prev_tokens.data_ptr(),
         markov_w1_weight.data_ptr(),
@@ -774,6 +1091,8 @@ def markov_fold_gumbel_cache_r1(
     step_col: int,
     softcap: float,
     out_draft_col: torch.Tensor,
+    skip_flag: torch.Tensor | None = None,
+    keep_dirty: torch.Tensor | None = None,
 ) -> torch.Tensor:
     dev = latent.device
     d_idx = dev.index or 0
@@ -787,7 +1106,38 @@ def markov_fold_gumbel_cache_r1(
         _MFGC_WS[d_idx] = ws
     ws_max, ws_id, ctr = ws
     out_sampled = torch.empty((1,), dtype=torch.int64, device=dev)
-    _get_lib().launch_markov_fold_gumbel_cache_r1_sm80(
+    lib = _get_lib()
+    if (skip_flag is not None or keep_dirty is not None) and hasattr(
+        lib, "launch_markov_fold_gumbel_cache_r1_suf_sm80"
+    ):
+        lib.launch_markov_fold_gumbel_cache_r1_suf_sm80(
+            latent.data_ptr(),
+            fold_weight.data_ptr(),
+            fold_bias.data_ptr(),
+            base_logits_1d.data_ptr(),
+            keep_ids.data_ptr(),
+            idx_map_step.data_ptr(),
+            temperature.data_ptr(),
+            seeds.data_ptr(),
+            sample_pos_step.data_ptr(),
+            _ptr(row_mapping),
+            _ptr(skip_flag),
+            _ptr(keep_dirty),
+            logits_cache.data_ptr(),
+            ws_max.data_ptr(),
+            ws_id.data_ptr(),
+            ctr.data_ptr(),
+            out_sampled.data_ptr(),
+            out_draft_col.data_ptr(),
+            logits_cache.stride(0),
+            logits_cache.stride(1),
+            int(step_col),
+            int(fold_weight.shape[0]),
+            float(softcap),
+            _stream(dev),
+        )
+        return out_sampled
+    lib.launch_markov_fold_gumbel_cache_r1_sm80(
         latent.data_ptr(),
         fold_weight.data_ptr(),
         fold_bias.data_ptr(),

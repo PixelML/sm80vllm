@@ -25,8 +25,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.inkling.nvidia.ops.fa4_rel_attention import bucket_max_seqlen_q
+from vllm.models.inkling.nvidia.ops.sconv import sconv_seq_metadata
 from vllm.models.inkling.nvidia.sconv_swa_attn import (
     InklingConvState,
+    InklingSconvMetadata,
     InklingSconvMetadataBuilder,
 )
 from vllm.platforms import current_platform
@@ -78,6 +80,75 @@ InklingSconvMetadataBuilder.get_varlen_cudagraph_max_query_len = classmethod(  #
         else _orig_sconv_varlen_max_q(cls, vllm_config, kv_cache_spec)
     )
 )
+
+# Deduplicate `sconv_seq_metadata` across all conv KV cache groups in a step
+# (saves 5 redundant Triton launches/step in BF16 and FP8).
+_SCONV_SHARED_BUFS: dict[
+    tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]
+] = {}
+_SCONV_LAST_STEP: dict[tuple[torch.device, int], tuple[torch.Tensor, int]] = {}
+_orig_sconv_builder_init = InklingSconvMetadataBuilder.__init__
+_orig_sconv_builder_build = InklingSconvMetadataBuilder.build
+
+
+def _patched_sconv_init(self, kv_cache_spec, layer_names, vllm_config, device):
+    _orig_sconv_builder_init(self, kv_cache_spec, layer_names, vllm_config, device)
+    if is_sm80():
+        max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        key = (device, max_num_tokens)
+        self._sconv_key = key
+        bufs = _SCONV_SHARED_BUFS.get(key)
+        if bufs is None:
+            bufs = (self.seq_idx_buffer, self.query_start_buffer)
+            _SCONV_SHARED_BUFS[key] = bufs
+        else:
+            self.seq_idx_buffer, self.query_start_buffer = bufs
+
+
+def _patched_sconv_build(
+    self,
+    common_prefix_len: int,
+    common_attn_metadata: CommonAttentionMetadata,
+    fast_build: bool = False,
+) -> InklingSconvMetadata:
+    if not is_sm80():
+        return _orig_sconv_builder_build(
+            self, common_prefix_len, common_attn_metadata, fast_build
+        )
+    num_reqs = common_attn_metadata.num_reqs
+    num_actual_tokens = int(common_attn_metadata.query_start_loc_cpu[-1])
+    num_padded_tokens = common_attn_metadata.slot_mapping.shape[0]
+    assert num_padded_tokens >= num_actual_tokens
+
+    key = getattr(self, "_sconv_key", (self.device, self.seq_idx_buffer.shape[0]))
+    prev = _SCONV_LAST_STEP.get(key)
+    if (
+        prev is None
+        or prev[0] is not common_attn_metadata.seq_lens
+        or prev[1] != num_padded_tokens
+    ):
+        sconv_seq_metadata(
+            common_attn_metadata.query_start_loc,
+            num_reqs,
+            num_actual_tokens,
+            self.seq_idx_buffer,
+            self.query_start_buffer,
+            num_padded_tokens,
+        )
+        _SCONV_LAST_STEP[key] = (common_attn_metadata.seq_lens, num_padded_tokens)
+
+    return InklingSconvMetadata(
+        block_table=common_attn_metadata.block_table_tensor,
+        slot_mapping=common_attn_metadata.slot_mapping[:num_padded_tokens],
+        seq_idx=self.seq_idx_buffer[:num_padded_tokens],
+        query_start=self.query_start_buffer[:num_padded_tokens],
+    )
+
+
+if not getattr(InklingSconvMetadataBuilder, "_sm80_dedup_patched", False):
+    InklingSconvMetadataBuilder.__init__ = _patched_sconv_init  # type: ignore[method-assign]
+    InklingSconvMetadataBuilder.build = _patched_sconv_build  # type: ignore[method-assign]
+    InklingSconvMetadataBuilder._sm80_dedup_patched = True  # type: ignore[attr-defined]
 
 
 @dataclass

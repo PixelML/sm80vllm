@@ -240,7 +240,7 @@ class HummingExperts:
             # whose order (and so the result) changes from run to run.
             for _, _, kernel_config in tuning:
                 kernel_config["use_stream_k"] = False
-            # SM80 CMP 170HX (74 SMs) Round-3 v3 100%-Bitwise-Exact Cold-HBM Overrides
+            # SM80 CMP 170HX (74 SMs, 140 W) Round-5 0-ULP Cold-HBM Overrides
             if is_sm80():
                 def _mk_cfg(b_sh, w_sh, stg, cta, evict=False):
                     return {
@@ -277,9 +277,13 @@ class HummingExperts:
                             [
                                 16,
                                 256,
-                                _mk_cfg([8, 256, 64], [8, 32, 64], 4, 2, evict=True),
+                                _mk_cfg([8, 128, 64], [8, 32, 64], 5, 3, evict=False),
                             ],
-                            [256, 912, _up_cfg(512)],
+                            [
+                                256,
+                                912,
+                                _mk_cfg([8, 256, 128], [8, 64, 64], 4, 2, evict=True),
+                            ],
                             [912, 4096, c_prefill_2k],
                             [4096, 1 << 30, c_prefill_hi],
                         ]
@@ -288,7 +292,7 @@ class HummingExperts:
                             [
                                 16,
                                 256,
-                                _mk_cfg([8, 256, 128], [8, 64, 64], 4, 2, evict=True),
+                                _mk_cfg([8, 128, 128], [8, 64, 64], 3, 3, evict=True),
                             ],
                             [
                                 256,
