@@ -18,6 +18,9 @@ import torch
 from torch import nn
 
 from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.triton_utils import tl as _tl
+from vllm.triton_utils import tldevice as _tldevice
+from vllm.triton_utils import triton as _triton
 
 from ..configs import Inkling2ModelConfig
 from ..quant_config import Inkling2QuantConfig
@@ -26,14 +29,123 @@ from .model import (
     Inkling2ForConditionalGeneration,
     Inkling2Model,
 )
+from .ops import is_sm80
 from .ops.attn_res import attn_res
 from .ops.linear import linear_k_groups
 from .ops.ll_gemm_sm80 import sm80_bf16_ll_gemm, use_sm80_bf16_ll_gemm
 from .ops.ll_gemm_sm120 import sm12x_bf16_ll_gemm, use_sm12x_bf16_ll_gemm
 from .ops.loop import blend_rms_norm, pair_rms_norm
+from .ops.norm import rsqrt as _rsqrt
 from .sconv import conv_metadata
 
 LOOP_STREAMS = ("attn", "k", "v", "mlp")
+
+
+@_triton.jit
+def _bank_attn_res_1pass_kernel(
+    Bank,
+    Queries,
+    Out,
+    stride_b0,
+    T,
+    eps,
+    D: _tl.constexpr,
+    Q_PER_CTA: _tl.constexpr,
+    BLOCK_A: _tl.constexpr,
+    BLOCK_B: _tl.constexpr,
+):
+    q_base = _tl.program_id(0) * Q_PER_CTA
+    t = _tl.program_id(1).to(_tl.int64)
+    row_off = t * D
+    da = _tl.arange(0, BLOCK_A)
+    db = BLOCK_A + _tl.arange(0, BLOCK_B)
+    mask_a = da < D
+    mask_b = db < D
+
+    xa0 = _tl.load(Bank + row_off + da, mask_a, other=0).to(_tl.float32)
+    xb0 = _tl.load(Bank + row_off + db, mask_b, other=0).to(_tl.float32)
+    xa1 = _tl.load(Bank + stride_b0 + row_off + da, mask_a, other=0).to(_tl.float32)
+    xb1 = _tl.load(Bank + stride_b0 + row_off + db, mask_b, other=0).to(_tl.float32)
+
+    rstd0 = _rsqrt(_tl.fma(_tl.sum(xa0 * xa0) + _tl.sum(xb0 * xb0), 1.0 / D, eps))
+    rstd1 = _rsqrt(_tl.fma(_tl.sum(xa1 * xa1) + _tl.sum(xb1 * xb1), 1.0 / D, eps))
+
+    for qi in _tl.static_range(Q_PER_CTA):
+        q_off = (q_base + qi) * D
+        qa = _tl.load(Queries + q_off + da, mask_a, other=0)
+        qb = _tl.load(Queries + q_off + db, mask_b, other=0)
+        l0 = (_tl.sum(qa * xa0) + _tl.sum(qb * xb0)) * rstd0
+        l1 = (_tl.sum(qa * xa1) + _tl.sum(qb * xb1)) * rstd1
+        mx = _tl.maximum(l0, l1)
+        e0 = _tldevice.exp(l0 - mx)
+        e1 = _tldevice.exp(l1 - mx)
+        inv_sum = _tl.div_rn(1.0, e0 + e1)
+        p0 = e0 * rstd0
+        p1 = e1 * rstd1
+        acc_a = (
+            _tl.fma(p1, xa1, _tl.fma(p0, xa0, _tl.zeros((BLOCK_A,), _tl.float32)))
+            * inv_sum
+        )
+        acc_b = (
+            _tl.fma(p1, xb1, _tl.fma(p0, xb0, _tl.zeros((BLOCK_B,), _tl.float32)))
+            * inv_sum
+        )
+        out_ptr = Out + (q_base + qi).to(_tl.int64) * T * D + row_off
+        _tl.store(out_ptr + da, acc_a, mask_a)
+        _tl.store(out_ptr + db, acc_b, mask_b)
+
+
+def sm80_bank_attn_res(bank: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
+    """Single-pass 0-ULP SM80 bank AttnRes (N_SRC=2, Q=4, D=2304, fp32 out)."""
+    t = bank.shape[1]
+    if (
+        is_sm80()
+        and 1 <= t <= 64
+        and bank.shape == (2, t, 2304)
+        and queries.shape == (4, 2304)
+        and bank.dtype == torch.bfloat16
+        and queries.dtype == torch.float32
+        and bank.stride(1) == 2304
+        and bank.stride(2) == 1
+        and queries.is_contiguous()
+    ):
+        out = torch.empty((4, t, 2304), dtype=torch.float32, device=bank.device)
+        qpc = 2 if t > 16 else 1
+        _bank_attn_res_1pass_kernel[(4 // qpc, t)](
+            bank,
+            queries,
+            out,
+            bank.stride(0),
+            t,
+            1e-6,
+            D=2304,
+            Q_PER_CTA=qpc,
+            BLOCK_A=2048,
+            BLOCK_B=256,
+            num_warps=8,
+            enable_fp_fusion=False,
+        )
+        return out
+    return attn_res(bank[:1], bank[1], None, queries, None, 0.0, True)
+
+
+def sm80_fast_blend(
+    ctrl_down: torch.Tensor,
+    ctrl_up: torch.Tensor,
+    dest: torch.Tensor,
+    message: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+) -> torch.Tensor | None:
+    """2-launch SM80 Tensor-Core fused loop controller:
+    (pair_rms_norm + down) + (up + unfused tanh blend + RMSNorm)."""
+    if not is_sm80():
+        return None
+    from ..sm80_ops_v2 import fast_blend_r6_2304
+
+    return fast_blend_r6_2304(
+        ctrl_down, ctrl_up, dest, message, norm_weight, norm_eps
+    )
 
 
 class Inkling2MessageController(nn.Module):
@@ -122,9 +234,13 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
         """The `streams` controllers on fp32 `(S, T, D)` `dest` (may
         broadcast over streams) and `message`, each output RMS-normalized
         with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
-        pair = pair_rms_norm(dest, message)
         down = self.controller_down[streams]
         up = self.controller_gain_forget[streams]
+        if is_sm80():
+            out = sm80_fast_blend(down, up, dest, message, norm_weight, norm_eps)
+            if out is not None:
+                return out
+        pair = pair_rms_norm(dest, message)
         if use_sm12x_bf16_ll_gemm(pair, down):
             hidden = sm12x_bf16_ll_gemm(pair, down)
             gain_forget = sm12x_bf16_ll_gemm(hidden, up, out_dtype=torch.float32)
@@ -232,15 +348,19 @@ class Inkling2LoopModel(Inkling2Model):
         if bank is not None:
             assert isinstance(layer, Inkling2LoopDecoderLayer) and inputs is not None
             # All four streams' messages: a mix of the bank's two blocks.
-            messages = attn_res(
-                bank[:1],
-                bank[1],
-                None,
-                self.message_queries[i - self.loop_core.start],
-                None,
-                0.0,
-                True,
-            )
+            q_msg = self.message_queries[i - self.loop_core.start]
+            if is_sm80():
+                messages = sm80_bank_attn_res(bank, q_msg)
+            else:
+                messages = attn_res(
+                    bank[:1],
+                    bank[1],
+                    None,
+                    q_msg,
+                    None,
+                    0.0,
+                    True,
+                )
             norm = layer.attn_norm
             dests, norm_weight = inputs, norm.weight
             if layer.is_local:
@@ -312,14 +432,31 @@ class Inkling2LoopModel(Inkling2Model):
                 owner=owner,
             )
         else:
-            # The MoE output is all-reduced (in bf16) inside layer.mlp.
-            outputs = layer.mlp_sconv.conv_mix(
-                layer.mlp(mlp_in[0], pass_idx=pass_idx),
-                *mix_args,
-                addend=attn_out,
-                residual=residual,
-                owner=owner,
-            )
+            if (
+                is_sm80()
+                and hasattr(layer.mlp, "experts")
+                and layer.mlp.experts.ep_size == 1
+            ):
+                mlp_down, mlp_src2dst = layer.mlp(
+                    mlp_in[0], reduce=False, pass_idx=pass_idx
+                )
+                outputs = layer.mlp_sconv.conv_mix(
+                    mlp_down,
+                    *mix_args,
+                    addend=attn_out,
+                    residual=residual,
+                    owner=owner,
+                    src2dst=mlp_src2dst,
+                )
+            else:
+                # The MoE output is all-reduced (in bf16) inside layer.mlp.
+                outputs = layer.mlp_sconv.conv_mix(
+                    layer.mlp(mlp_in[0], pass_idx=pass_idx),
+                    *mix_args,
+                    addend=attn_out,
+                    residual=residual,
+                    owner=owner,
+                )
         return num_blocks, outputs
 
     def forward(

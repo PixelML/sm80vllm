@@ -176,33 +176,78 @@ class _Config(NamedTuple):
     num_stages: int
 
 
+_SMEM_LIMIT_BYTES = 156 * 1024
+_PARTIALS_WS: dict[tuple[int, int], torch.Tensor] = {}
+_RETIRED_PARTIALS_WS: list[torch.Tensor] = []
+
+
 @functools.cache
 def _config(nb: int, n: int, k: int) -> _Config:
     num_sms = num_compute_units()
     bk = min(128, max(16, triton.next_power_of_2(k)))
     k_tiles = triton.cdiv(k, bk)
-    for bn in (16, 32, 64):
-        if nb * triton.cdiv(n, bn) > _MAX_TILES:
-            continue
-        split = min(32, k_tiles, num_sms // max(1, nb * triton.cdiv(n, bn)))
-        if split >= 2:
-            tiles_per_split = triton.cdiv(k_tiles, split)
-            split = triton.cdiv(k_tiles, tiles_per_split)
+    # On 74-SM CMP 170HX (num_sms <= 80), preserve the exact Round-5 0-ULP
+    # tile/split schedule (BN=128 on 8600x2304 = 68 CTAs = 44.0 us) while
+    # eliminating per-step torch.empty allocations via _partials_workspace.
+    if num_sms <= 80:
+        for bn in (16, 32, 64):
+            if nb * triton.cdiv(n, bn) > _MAX_TILES:
+                continue
+            split = min(32, k_tiles, num_sms // max(1, nb * triton.cdiv(n, bn)))
             if split >= 2:
-                return _Config(bn, bk, split, tiles_per_split * bk, 4, 4)
-    bk = min(128, max(16, triton.next_power_of_2(k)))
-    if nb == 1 and 4608 < n < 16384:
-        bn = 128
-    elif n >= 16384 or (nb == 1 and n > 2048):
-        bn = 64
-    else:
-        bn = 32
-    return _Config(bn, bk, 1, triton.cdiv(k, bk) * bk, 4, 4)
+                tiles_per_split = triton.cdiv(k_tiles, split)
+                split = triton.cdiv(k_tiles, tiles_per_split)
+                if split >= 2:
+                    return _Config(bn, bk, split, tiles_per_split * bk, 4, 4)
+        if nb == 1 and 4608 < n < 16384:
+            bn = 128
+        elif n >= 16384 or (nb == 1 and n > 2048):
+            bn = 64
+        else:
+            bn = 32
+        return _Config(bn, bk, 1, k_tiles * bk, 4, 4)
+    # On 108-SM A100 (num_sms > 80), only split-K when bn=32 cannot fill >= 60% of SMs:
+    if nb * triton.cdiv(n, 32) < (num_sms * 3) // 5:
+        for bn in (16, 32, 64):
+            if nb * triton.cdiv(n, bn) > _MAX_TILES:
+                continue
+            split = min(32, k_tiles, num_sms // max(1, nb * triton.cdiv(n, bn)))
+            if split >= 2:
+                tiles_per_split = triton.cdiv(k_tiles, split)
+                split = triton.cdiv(k_tiles, tiles_per_split)
+                if split >= 2:
+                    return _Config(bn, bk, split, tiles_per_split * bk, 4, 4)
+    if nb == 1 and n <= 2304:
+        if k >= 6144:
+            return _Config(16, bk, 1, k_tiles * bk, 2, 5)
+        return _Config(32, bk, 1, k_tiles * bk, 4, 5)
+    if nb == 1 and n <= 10240:
+        return _Config(32, bk, 1, k_tiles * bk, 4, 4)
+    if n > 10240:
+        return _Config(64, bk, 1, k_tiles * bk, 4, 3)
+    bn = 64 if nb == 1 and n > 2304 else 32
+    return _Config(bn, bk, 1, k_tiles * bk, 4, 4)
 
 
 @functools.cache
-def _counter(stream: int) -> torch.Tensor:
-    return torch.zeros(_MAX_TILES, dtype=torch.int32, device="cuda")
+def _counter(stream: int, device_idx: int) -> torch.Tensor:
+    return torch.zeros(
+        _MAX_TILES, dtype=torch.int32, device=torch.device("cuda", device_idx)
+    )
+
+
+def _partials_workspace(
+    stream: int, device: torch.device, needed: int
+) -> torch.Tensor:
+    key = (stream, device.index or 0)
+    buf = _PARTIALS_WS.get(key)
+    if buf is None or buf.numel() < needed:
+        if buf is not None:
+            _RETIRED_PARTIALS_WS.append(buf)
+        cap = max(needed, 2 * 1024 * 1024)
+        buf = torch.empty(cap, dtype=torch.float32, device=device)
+        _PARTIALS_WS[key] = buf
+    return buf[:needed]
 
 
 def _ll_gemm(
@@ -219,12 +264,14 @@ def _ll_gemm(
     cfg = _config(nb, n, k)
     n_tiles = triton.cdiv(n, cfg.bn)
     partials = counter = None
+    stream_id = current_stream().cuda_stream
     if cfg.split > 1:
         assert nb * n_tiles <= _MAX_TILES
-        partials = torch.empty(
-            (cfg.split, nb, mp, n), dtype=torch.float32, device=x.device
-        )
-        counter = _counter(current_stream().cuda_stream)
+        needed = cfg.split * nb * mp * n
+        partials = _partials_workspace(stream_id, x.device, needed)
+        counter = _counter(stream_id, x.device.index or 0)
+    stage_bytes = mp * cfg.bk * 2 + cfg.bn * cfg.bk * 2
+    num_stages = max(1, min(cfg.num_stages, _SMEM_LIMIT_BYTES // stage_bytes))
     _ll_gemm_kernel[(n_tiles, nb, cfg.split)](
         x,
         w,
@@ -247,7 +294,7 @@ def _ll_gemm(
         SPLIT=cfg.split,
         MP=mp,
         num_warps=cfg.num_warps,
-        num_stages=cfg.num_stages,
+        num_stages=num_stages,
     )
 
 

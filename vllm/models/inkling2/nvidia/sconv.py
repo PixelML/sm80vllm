@@ -166,6 +166,7 @@ class Inkling2ShortConv(nn.Module):
         halo: int = 0,
         prefix_align: int = 0,
         owner: InklingConvState | None = None,
+        src2dst: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Convolve the reduced `x` into `out` like `forward` and return
         the AttnRes mixes of `[*stack, (last +) out]` with `queries`
@@ -204,6 +205,7 @@ class Inkling2ShortConv(nn.Module):
             sp=sp,
             halo=halo,
             prefix_align=prefix_align,
+            src2dst=src2dst,
         )
 
     def all_reduce_mix(

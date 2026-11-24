@@ -65,6 +65,138 @@ def mix_rmsnorm(
 
 
 @triton.jit
+def _mix_rmsnorm_4x_kernel(
+    CTX,
+    FRNN,
+    ALPHA,
+    WEIGHT,
+    OUT_CTX,
+    OUT_FRNN,
+    ctx_row_stride,
+    frnn_row_stride,
+    alpha_s0,
+    alpha_s1,
+    w_s0,
+    out_ctx_s0,
+    M_CTX,
+    TAPS: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    h = tl.arange(0, BLOCK)
+    mask = h < HIDDEN
+    if pid < M_CTX:
+        m0 = tl.zeros((BLOCK,), tl.float32)
+        m1 = tl.zeros((BLOCK,), tl.float32)
+        m2 = tl.zeros((BLOCK,), tl.float32)
+        row_ptr = CTX + pid * ctx_row_stride
+        for tap in tl.static_range(TAPS):
+            x = tl.load(row_ptr + tap * HIDDEN + h, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            a0 = tl.load(ALPHA + 0 * alpha_s0 + tap * alpha_s1).to(tl.float32)
+            a1 = tl.load(ALPHA + 1 * alpha_s0 + tap * alpha_s1).to(tl.float32)
+            a2 = tl.load(ALPHA + 2 * alpha_s0 + tap * alpha_s1).to(tl.float32)
+            m0 += x * a0
+            m1 += x * a1
+            m2 += x * a2
+        inv0 = tl.rsqrt(tl.sum(m0 * m0, 0) / HIDDEN + EPS)
+        w0 = tl.load(WEIGHT + 0 * w_s0 + h, mask=mask, other=0.0).to(tl.float32)
+        tl.store(
+            OUT_CTX + 0 * out_ctx_s0 + pid * HIDDEN + h,
+            (m0 * inv0 * w0).to(OUT_CTX.dtype.element_ty),
+            mask=mask,
+        )
+        inv1 = tl.rsqrt(tl.sum(m1 * m1, 0) / HIDDEN + EPS)
+        w1 = tl.load(WEIGHT + 1 * w_s0 + h, mask=mask, other=0.0).to(tl.float32)
+        tl.store(
+            OUT_CTX + 1 * out_ctx_s0 + pid * HIDDEN + h,
+            (m1 * inv1 * w1).to(OUT_CTX.dtype.element_ty),
+            mask=mask,
+        )
+        inv2 = tl.rsqrt(tl.sum(m2 * m2, 0) / HIDDEN + EPS)
+        w2 = tl.load(WEIGHT + 2 * w_s0 + h, mask=mask, other=0.0).to(tl.float32)
+        tl.store(
+            OUT_CTX + 2 * out_ctx_s0 + pid * HIDDEN + h,
+            (m2 * inv2 * w2).to(OUT_CTX.dtype.element_ty),
+            mask=mask,
+        )
+    else:
+        r = pid - M_CTX
+        m3 = tl.zeros((BLOCK,), tl.float32)
+        row_ptr = FRNN + r * frnn_row_stride
+        for tap in tl.static_range(TAPS):
+            x = tl.load(row_ptr + tap * HIDDEN + h, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            a3 = tl.load(ALPHA + 3 * alpha_s0 + tap * alpha_s1).to(tl.float32)
+            m3 += x * a3
+        inv3 = tl.rsqrt(tl.sum(m3 * m3, 0) / HIDDEN + EPS)
+        w3 = tl.load(WEIGHT + 3 * w_s0 + h, mask=mask, other=0.0).to(tl.float32)
+        tl.store(
+            OUT_FRNN + r * HIDDEN + h,
+            (m3 * inv3 * w3).to(OUT_FRNN.dtype.element_ty),
+            mask=mask,
+        )
+
+
+def sm80_mix_rmsnorm_4x(
+    ctx_states: torch.Tensor,
+    frnn_rows: torch.Tensor | None,
+    fuse_alpha: torch.Tensor,
+    dflare_ws: torch.Tensor,
+    eps: float,
+) -> tuple[list[torch.Tensor], torch.Tensor | None]:
+    """Fused 4-way DSpark context mix + RMSNorm in a single read of `ctx_states`."""
+    m_ctx = ctx_states.shape[0]
+    taps = fuse_alpha.shape[1]
+    hidden = dflare_ws.shape[1]
+    ctx2 = (
+        ctx_states.view(m_ctx, taps * hidden)
+        if ctx_states.ndim == 2
+        else ctx_states.contiguous().view(m_ctx, taps * hidden)
+    )
+    m_frnn = 0 if frnn_rows is None else frnn_rows.shape[0]
+    if frnn_rows is not None:
+        frnn2 = (
+            frnn_rows.view(m_frnn, taps * hidden)
+            if frnn_rows.ndim == 2
+            else frnn_rows.contiguous().view(m_frnn, taps * hidden)
+        )
+    else:
+        frnn2 = ctx2
+    out_ctx = ctx_states.new_empty((3, m_ctx, hidden))
+    out_frnn = (
+        ctx_states.new_empty((m_frnn, hidden)) if frnn_rows is not None else None
+    )
+    total_rows = m_ctx + m_frnn
+    if total_rows:
+        _mix_rmsnorm_4x_kernel[(total_rows,)](
+            ctx2,
+            frnn2,
+            fuse_alpha,
+            dflare_ws,
+            out_ctx,
+            out_frnn if out_frnn is not None else out_ctx,
+            ctx2.stride(0),
+            frnn2.stride(0),
+            fuse_alpha.stride(0),
+            fuse_alpha.stride(1),
+            dflare_ws.stride(0),
+            out_ctx.stride(0),
+            m_ctx,
+            TAPS=taps,
+            HIDDEN=hidden,
+            EPS=eps,
+            BLOCK=triton.next_power_of_2(hidden),
+            num_warps=8,
+        )
+    return [out_ctx[0], out_ctx[1], out_ctx[2]], out_frnn
+
+
+@triton.jit
 def _qk_norm_rope_kernel(
     X,
     Q_WEIGHT,

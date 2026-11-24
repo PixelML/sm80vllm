@@ -66,6 +66,58 @@ class ExpertsLoRA(Protocol):
     ) -> None: ...
 
 
+def sm80_route_and_align(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+    gate_bias: torch.Tensor,
+    expert_bounds: torch.Tensor,
+    route_scale: float,
+    block_size: int = 8,
+    is_padding: torch.Tensor | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """1-launch SM80 router + top-8 (SORT=True) + parallel moe_align for 1 <= T <= 16."""
+    t = x.shape[0]
+    if (
+        1 <= t <= 16
+        and x.shape[1] == 2304
+        and gate_weight.shape == (128, 2304)
+        and x.dtype == torch.bfloat16
+        and gate_weight.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and gate_weight.is_contiguous()
+    ):
+        from ..sm80_ops_v2 import select_and_align_r6_128
+
+        res = select_and_align_r6_128(
+            x,
+            gate_weight,
+            gate_bias,
+            expert_bounds,
+            route_scale,
+            block_size,
+            is_padding,
+            mode=0,
+        )
+        if res is not None:
+            return res
+    from ..sm80_ops_v2 import moe_align_block_size as sm80_align
+
+    ids, w, s2d = select_experts(
+        x, gate_weight, gate_bias, 8, route_scale, expert_bounds, is_padding
+    )
+    s_ids, e_ids, n_pad = sm80_align(
+        ids, block_size, gate_weight.shape[0], ignore_invalid_experts=True
+    )
+    return ids, w, s2d, s_ids, e_ids, n_pad
+
+
 class Inkling2Gate(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
@@ -409,6 +461,31 @@ class Inkling2MoE(nn.Module):
                 )
                 return experts(
                     x, (ids, gammas, src2dst, pre_align8), None, None, reduce, push
+                )
+            if (
+                is_sm80()
+                and 1 <= x.shape[0] <= 16
+                and experts.ep_size == 1
+                and experts.num_experts == 128
+                and gate.topk == 8
+                and x.shape[1] == 2304
+            ):
+                ids, gammas, src2dst, s_ids, e_ids, n_pad = sm80_route_and_align(
+                    x,
+                    gate.weight,
+                    gate.bias,
+                    experts.expert_bounds,
+                    gate.route_scale,
+                    8,
+                    is_padding,
+                )
+                return experts(
+                    x,
+                    (ids, gammas, src2dst, (s_ids, e_ids, n_pad)),
+                    None,
+                    None,
+                    reduce,
+                    push,
                 )
             selected = select_experts(
                 x,
