@@ -18,6 +18,10 @@ __all__ = [
 
 
 def __getattr__(name: str):
+    if name in __all__:
+        from .sm80_tp_ops import install_sm80_tp_ops
+
+        install_sm80_tp_ops()
     if name == "Inkling2DSparkModel":
         from .nvidia import dspark
 
