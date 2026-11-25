@@ -171,8 +171,10 @@ def fp8_paged_mqa_logits_triton(
             the logits buffer and grid stay tight.
         clean_logits: when False, skip the -inf pre-fill of the output
             (indexer top-k reads only `[:context_len]` per row).
+
     Returns:
         logits:        [B*next_n, max_model_len] float32
+
     """
     B, next_n, num_heads, head_dim = q.shape
     _, block_size, one, d_plus_4 = kv_cache.shape
@@ -363,8 +365,10 @@ def fp8_mqa_logits_triton(
         cu_seqlen_ke: [M] int32
         clean_logits: when False, skip the -inf pre-fill of the output
             (indexer top-k reads only `[ks, ke)` per row). Matches DeepGEMM.
+
     Returns:
         logits:       [M, N] float32
+
     """
     k_fp8, k_scales = kv
     k_scales = k_scales.reshape(-1)
