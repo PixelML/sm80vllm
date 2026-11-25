@@ -82,6 +82,37 @@ from .vision import Inkling2VisionEncoder, VisionMetadata
 class Inkling2LogitsProcessor(LogitsProcessor):
     """Use the low-M projection while preserving vocab gathering and softcaps."""
 
+    def forward(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+        skip_gather: bool = False,
+    ) -> torch.Tensor | None:
+        from .ops import is_sm80
+
+        if (
+            is_sm80()
+            and not self.logits_as_input
+            and not skip_gather
+            and lm_head.tp_size == 1
+            and self.soft_cap is not None
+            and self.scale == 1.0
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] > 32
+            and self.head_dtype == torch.float32
+        ):
+            from ..sm80_ops_v2 import sm80_logits_softcap_fp32
+
+            raw = self._apply_head(lm_head, hidden_states, embedding_bias)
+            capped = sm80_logits_softcap_fp32(
+                raw, self.org_vocab_size, self.soft_cap
+            )
+            if capped is not None:
+                return capped
+        return super().forward(lm_head, hidden_states, embedding_bias, skip_gather)
+
     def _apply_head(self, lm_head, hidden_states, embedding_bias):
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
         from vllm.model_executor.layers.vocab_parallel_embedding import (

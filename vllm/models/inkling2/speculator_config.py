@@ -37,6 +37,9 @@ class Inkling2DSparkSpeculatorConfig(DSparkSpeculatorConfig):
             elif spec.kv_cache_dtype not in ("auto", "bfloat16"):
                 raise ValueError("Inkling2 DSpark on SM12 requires BF16 draft KV")
         elif is_sm80():
+            from .sm80_tp_ops import install_sm80_spec_schedule_hooks
+
+            install_sm80_spec_schedule_hooks()
             # Keep DSpark's 3 draft layers in BF16 even when target uses FP8 KV.
             if spec.kv_cache_dtype is None:
                 spec.kv_cache_dtype = "bfloat16"
